@@ -2,12 +2,33 @@ name: Build app packages
 
 on:
   workflow_dispatch:
+    inputs:
+      with_ios:
+        description: '构建 iOS 包（macOS runner 按 10 倍分钟计费；一次约 200 账单分钟，Free 额度一个月只够一次，默认关）'
+        type: boolean
+        default: false
+      with_macos:
+        description: '构建 macOS 包（同样走 macOS runner、同样 10 倍计费；默认关，需要 dmg 时再勾）'
+        type: boolean
+        default: false
+      full_variants:
+        description: 'iOS / macOS 出两个版本（短剧视界 + 全剧视界）；不勾只出全剧视界，省一半 macOS 计费分钟'
+        type: boolean
+        default: false
+      republish:
+        description: '重复发布：同一版本已有 Release / tag 时覆盖重发（取消勾选则报错停止）'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
+# 同一个分支只留一个运行：手动重跑时会排在旧运行后面变成 pending（旧运行若正卡在等
+# macOS runner，新运行连 job 都不会出现，看上去就像「不分配 runner」）。取消旧运行是安全的：
+# 发布用的 prepare 会检查同名 Release/tag，republish 默认勾选即覆盖重发。
 concurrency:
   group: app-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   GOPROXY: https://proxy.golang.org,direct
@@ -53,15 +74,20 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      exists_tag: ${{ steps.version.outputs.exists_tag }}
+      exists_release: ${{ steps.version.outputs.exists_release }}
     steps:
       - uses: actions/checkout@v4
       - id: version
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_REPUBLISH: ${{ inputs.republish }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "只能从 main 分支手动发布，当前为 $GITHUB_REF。" >&2
+          # 仓库默认分支可能是 main 也可能是 master，两个都放行，避免手动运行时
+          # 被分支名校验直接拦下（Actions 只能选仓库里真实存在的分支）。
+          if [ "$GITHUB_REF" != "refs/heads/main" ] && [ "$GITHUB_REF" != "refs/heads/master" ]; then
+            echo "只能从 main / master 分支手动发布，当前为 $GITHUB_REF。" >&2
             exit 1
           fi
           version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
@@ -70,11 +96,26 @@ jobs:
             exit 1
           fi
           tag="app-v${version//+/-}"
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1 || gh release view "$tag" >/dev/null 2>&1; then
-            echo "::warning::版本 $version（$tag）已发布过，本次将覆盖更新该 release 的备注与资产。"
+          exists_tag=0
+          exists_release=0
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            exists_tag=1
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            exists_release=1
+          fi
+          if [ "$exists_tag" = "1" ] || [ "$exists_release" = "1" ]; then
+            if [ "$INPUT_REPUBLISH" != "true" ]; then
+              echo "版本 $version（$tag）已发布过。勾选 republish 可覆盖重发，" >&2
+              echo "或提升 pubspec.yaml 的 version 后再发布。" >&2
+              exit 1
+            fi
+            echo "::warning::版本 $version（$tag）已存在（tag=$exists_tag release=$exists_release），勾选了重复发布，本次将覆盖旧 Release 与 tag 并把新包指到当前提交。"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "exists_tag=$exists_tag" >> "$GITHUB_OUTPUT"
+          echo "exists_release=$exists_release" >> "$GITHUB_OUTPUT"
 
   android:
     needs: prepare
@@ -270,11 +311,20 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # 注意：macOS runner 的分钟数按 10 倍计费（Free 计划每月 2000 分钟，折合 macOS
+  # 只有约 200 分钟），整条流程里 ios / macos 两个 job 用苹果机器，最容易被额度掐掉。
+  # 因此：
+  #   1. 用 with_ios / with_macos 两个开关分别控制要不要跑（额度紧张时手动关掉）；
+  #   2. 两个版本放在同一个 job 里顺序构建——Flutter/Go 环境初始化、pub get、
+  #      pod install 只付一次，第二个版本还能吃到同 job 内的 Go 构建缓存；
+  #   3. continue-on-error：iOS / macOS 出包失败不再连带把 Android / Windows /
+  #      网页版的发布也一起拦下来。
   ios:
     needs: prepare
+    if: ${{ inputs.with_ios }}
+    continue-on-error: true
     runs-on: macos-latest
     timeout-minutes: 60
-    strategy: *editions
     steps:
       - uses: actions/checkout@v4
       - *setup-python
@@ -295,12 +345,68 @@ jobs:
           go version
           flutter --version
           flutter precache --ios
-      - name: Build unsigned iOS packages
-        run: python scripts/build_ios.py ${{ matrix.arguments }}
+      - name: Build unsigned iOS packages (短剧视界)
+        if: ${{ inputs.full_variants }}
+        run: python scripts/build_ios.py
+      - name: Build unsigned iOS packages (全剧视界)
+        run: python scripts/build_ios.py --all-sources
+      - name: 提示 iOS 未出包
+        if: failure() || cancelled()
+        run: |
+          echo "::warning::iOS 本次未参与构建/未完成出包，Android、Windows、网页版仍会照常发布。"
+          echo "::warning::若这里是「账单额度不足」，请到 Settings → Billing 查看 Actions 用量或调高 spending limit。"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.edition }}-ios-unsigned
+          name: ios-unsigned
           path: dist/ios/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # macOS：macos-latest 现在是 Apple 芯片机器，Go 核心脚本里两片都编
+  # （arm64 + x86_64）再 lipo 成通用 dylib，Xcode 侧 Release 也默认出通用二进制，
+  # 所以只出一个 dmg，Intel 机器同样能原生跑。
+  macos:
+    needs: prepare
+    if: ${{ inputs.with_macos }}
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - *setup-python
+      - *setup-go
+      - *setup-flutter
+      - name: Check Xcode and CocoaPods
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          if ! command -v pod >/dev/null 2>&1; then
+            brew install cocoapods
+          fi
+          pod --version
+          # dmgbuild 负责 dmg 里的拖拽安装布局，Pillow 画背景图；任一缺失只是
+          # 退回普通 dmg，不影响出包，所以不设成硬依赖。
+          python -m pip install dmgbuild Pillow
+          go version
+          flutter --version
+          flutter precache --macos
+      - name: Build macOS packages (短剧视界)
+        if: ${{ inputs.full_variants }}
+        run: python scripts/build_macos.py
+      - name: Build macOS packages (全剧视界)
+        run: python scripts/build_macos.py --all-sources
+      - name: 提示 macOS 未出包
+        if: failure() || cancelled()
+        run: |
+          echo "::warning::macOS 本次未参与构建/未完成出包，Android、Windows、网页版仍会照常发布。"
+          echo "::warning::若这里是「账单额度不足」，请到 Settings → Billing 查看 Actions 用量或调高 spending limit。"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/macos/*
           if-no-files-found: error
           retention-days: 14
 
@@ -322,26 +428,59 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # macOS 分钟最容易被账单额度掐掉，iOS / macOS job 也可能直接没有出包（见两个开关）。
+  # 这里显式列出各 job 的 result 而不是单纯依赖 needs：iOS、macOS 跳过/失败只影响
+  # 它自己，Android、Windows、网页版照常发布；只有这几个失败才真正拦住发布。
   release:
-    needs: [checks, prepare, android, windows, ios, web]
+    needs: [checks, prepare, android, windows, ios, macos, web]
+    if: >-
+      ${{ !cancelled() &&
+          needs.prepare.result == 'success' &&
+          needs.checks.result == 'success' &&
+          needs.android.result == 'success' &&
+          needs.windows.result == 'success' &&
+          needs.web.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: 检查 Release 令牌是否有写权限
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          headers=$(curl -sS -D - -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO" || true)
+          accepted=$(printf '%s\n' "$headers" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-accepted-oauth-scopes"{print $2}')
+          echo "该仓库 Release 接口要求的权限：$accepted"
+          if printf '%s' "$accepted" | grep -qi "repo\|contents"; then :; else
+            echo "::warning::拿不到 API 的权限头，无法预处理判断，等下一步实际创建时再说。"
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: release
           merge-multiple: true
       - name: 发布 Release
         env:
-          GH_TOKEN: ${{ github.token }}
+          # 仓库默认令牌可能被仓库/组织设置压成只读；配了 RELEASE_TOKEN（有 repo 权限的
+          # 个人访问令牌）时优先用它作为兜底。
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          EXISTS_TAG: ${{ needs.prepare.outputs.exists_tag }}
+          EXISTS_RELEASE: ${{ needs.prepare.outputs.exists_release }}
           ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
         run: |
           set -euo pipefail
+          if [ -n "$ANDROID_CERT_SHA256" ]; then
+            cert_note="签名证书 SHA-256：${ANDROID_CERT_SHA256}"
+          else
+            cert_note="签名证书：未配置 ANDROID_CERT_SHA256，本次 APK 为 debug 签名（仅测试用，不能覆盖升级正式版本）"
+          fi
           cat > notes.md <<EOF
           版本 ${VERSION}。两个版本功能相同，区别只在站源范围，按需选择：
 
@@ -356,6 +495,11 @@ jobs:
           iOS：
           - *-ios-unsigned.ipa：未签名 IPA，可用相关工具安装
 
+          macOS：
+          - *-macos-universal.dmg：通用包，Apple 芯片与 Intel 机器都原生运行；打开后把应用拖进 Applications
+          - 包为 ad-hoc 签名（未公证），首次打开请在「系统设置 → 隐私与安全性」点「仍要打开」，或执行
+            xattr -dr com.apple.quarantine /Applications/短剧视界.app
+
           Windows：
           - *-windows-x64.zip：解压后运行 duanjushijie.exe 或 quanjushijie.exe
 
@@ -363,7 +507,7 @@ jobs:
           - guoappweb.zip：短剧视界 / 全剧视界 两个版本的合集（解压后得到 duanjushijie.zip / quanjushijie.zip，含 SHA256SUMS.txt）
           - 两个版本 zip 内均已内置 Windows 版 ffmpeg.exe，解压后双击 start.bat（Windows）或执行 sh start.sh（macOS/Linux），浏览器打开 http://127.0.0.1:8000/web/
 
-          签名证书 SHA-256：${ANDROID_CERT_SHA256}
+          ${cert_note}
           EOF
           changes="$(awk -v heading="## ${VERSION}" '
             $0 == heading { found = 1; next }
@@ -376,11 +520,68 @@ jobs:
             { printf '更新内容：\n\n%s\n\n' "$changes"; cat notes.md; } > notes.tmp
             mv notes.tmp notes.md
           fi
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG 已存在，覆盖更新（删除后重建）。"
-            gh release delete "$TAG" --cleanup-tag -y
+          ipa_count=$(find release -maxdepth 1 -name '*.ipa' | wc -l)
+          if [ "$ipa_count" -eq 0 ]; then
+            echo "::warning::本次发布未包含 iOS 包（未勾选 with_ios 或 iOS job 未成功）。"
+            printf '\n注意：本次发布未包含 iOS 包，原因见 Actions 运行详情里的 ios job。\n' >> notes.md
           fi
-          gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "短剧视界 / 全剧视界 ${VERSION}" --notes-file notes.md
+          # 减量构建：iOS 只有勾了 full_variants 才出短剧视界。说明里必须写清楚，
+          # 否则拿到包的人会以为短剧视界 IPA 是漏发了。
+          duanju_ipa=$(find release -maxdepth 1 -name 'duanjushijie-*.ipa' | wc -l)
+          if [ "$ipa_count" -gt 0 ] && [ "$duanju_ipa" -eq 0 ]; then
+            echo "::warning::本次 iOS 只出了全剧视界（full_variants 未勾选）。"
+            printf '\n注意：本次 iOS 只出了全剧视界（为节省 macOS 计费分钟），短剧视界 IPA 需另行构建。\n' >> notes.md
+          fi
+          dmg_count=$(find release -maxdepth 1 -name '*.dmg' | wc -l)
+          if [ "$dmg_count" -eq 0 ]; then
+            echo "::warning::本次发布未包含 macOS 包（未勾选 with_macos 或 macOS job 未成功）。"
+            printf '\n注意：本次发布未包含 macOS 包，原因见 Actions 运行详情里的 macos job。\n' >> notes.md
+          fi
+          duanju_dmg=$(find release -maxdepth 1 -name 'duanjushijie-*.dmg' | wc -l)
+          if [ "$dmg_count" -gt 0 ] && [ "$duanju_dmg" -eq 0 ]; then
+            echo "::warning::本次 macOS 只出了全剧视界（full_variants 未勾选）。"
+            printf '\n注意：本次 macOS 只出了全剧视界（为节省 macOS 计费分钟），短剧视界 dmg 需另行构建。\n' >> notes.md
+          fi
+          if [ "$EXISTS_RELEASE" = "1" ] || [ "$EXISTS_TAG" = "1" ]; then
+            printf '\n本次为重复发布：已用同名包覆盖此前的 %s 旧资产。\n' "$TAG" >> notes.md
+          fi
+          # 重复发布：先把同名 Release 和 tag 清掉，再按当前提交重建，否则 gh release
+          # create 会因为 tag 已存在而失败。顺序很重要——先删 Release（它靠 tag 定位），
+          # 再删 tag ref；任何一步失败都退到下面的「更新现有 Release」兜底。
+          if [ "$EXISTS_RELEASE" = "1" ]; then
+            echo "删除已存在的 Release $TAG …"
+            gh release delete "$TAG" --yes --cleanup-artifacts || true
+          fi
+          if [ "$EXISTS_TAG" = "1" ]; then
+            echo "删除已存在的远端 tag $TAG …"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" >/dev/null 2>&1 || true
+          fi
+          # 这里常见的失败是 HTTP 403 Resource not accessible by integration：
+          # 仓库/组织设置把 GITHUB_TOKEN 的默认权限压成了只读（job 里写的
+          # contents: write 未必能覆盖仓库级默认值）。给一句人能看懂的处理办法，
+          # 免得每次都来对 POST /releases 干瞪眼。
+          publishing_failed() {
+            echo "::error::发布 Release 失败。若提示 Resource not accessible by integration，"
+            echo "::error::请把 Settings → Actions → General → Workflow permissions 改成"
+            echo "::error::「Read and write permissions」，或在仓库 Secrets 配 RELEASE_TOKEN"
+            echo "::error::（带 repo 权限的个人访问令牌）；改完后必须重新触发一次新的运行，"
+            echo "::error::点 Re-run 重跑不生效——重跑会沿用原运行当时的令牌权限。"
+            exit 1
+          }
+          if gh release create "$TAG" release/* --target "$GITHUB_SHA" \
+                --title "短剧视界 / 全剧视界 ${VERSION}" --notes-file notes.md; then
+            exit 0
+          fi
+          # tag 没删干净（比如令牌没有删 ref 的权限）时落到这条兜底：
+          # 沿用已有 Release，覆盖同名资产并更新说明。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::warning::无法重建 Release，改为更新现有 Release 的资产与说明。"
+            gh release upload "$TAG" release/* --clobber || publishing_failed
+            gh release edit "$TAG" --title "短剧视界 / 全剧视界 ${VERSION}" \
+              --notes-file notes.md || publishing_failed
+            exit 0
+          fi
+          publishing_failed
       - name: 推送到 Telegram 频道
         continue-on-error: true
         env:

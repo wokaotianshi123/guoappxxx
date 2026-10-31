@@ -26,6 +26,16 @@ typedef _DartRequest = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _NativeFree = Void Function(Pointer<Utf8>);
 typedef _DartFree = void Function(Pointer<Utf8>);
 
+/// macOS 上 Go 核心是随包分发的 `Contents/Frameworks/libduanju_core.dylib`
+/// （由 scripts/build_macos.py 塞进去并补签名）。它不像 iOS 那样链进主程序，
+/// 所以只能按路径 dlopen，不能用 DynamicLibrary.process()。
+String _macosCoreLibraryPath() => path.join(
+  path.dirname(Platform.resolvedExecutable),
+  '..',
+  'Frameworks',
+  'libduanju_core.dylib',
+);
+
 String _nativeRequest(String body) {
   final DynamicLibrary library;
   if (Platform.isAndroid) {
@@ -34,10 +44,12 @@ String _nativeRequest(String body) {
     library = DynamicLibrary.open(
       path.join(path.dirname(Platform.resolvedExecutable), 'duanju_core.dll'),
     );
+  } else if (Platform.isMacOS) {
+    library = DynamicLibrary.open(_macosCoreLibraryPath());
   } else if (Platform.isIOS) {
     library = DynamicLibrary.process();
   } else {
-    throw UnsupportedError('当前首版支持 Android 手机和 Windows 电脑');
+    throw UnsupportedError('当前支持 Android、iOS、Windows 和 macOS');
   }
   final request = library.lookupFunction<_NativeRequest, _DartRequest>(
     'DuanjuRequest',
@@ -77,6 +89,8 @@ void installStderrLog(String logPath) {
       library = DynamicLibrary.open(
         path.join(path.dirname(Platform.resolvedExecutable), 'duanju_core.dll'),
       );
+    } else if (Platform.isMacOS) {
+      library = DynamicLibrary.open(_macosCoreLibraryPath());
     } else if (Platform.isIOS) {
       library = DynamicLibrary.process();
     } else {

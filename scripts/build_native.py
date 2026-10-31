@@ -70,8 +70,27 @@ elif options.platform == 'windows':
     build('windows', 'amd64', compiler, root / 'windows' / 'runner' / 'duanju_core.dll',
           {'CGO_LDFLAGS': '-static-libgcc'})
 else:
+    # macOS：编成 c-shared dylib，随应用放进 Contents/Frameworks，
+    # Dart 侧用 DynamicLibrary.open() 按路径加载（见 lib/core_bridge.dart）。
+    # 两片都编再 lipo 成通用库：Apple 芯片原生跑，Intel 机器也原生跑，
+    # 只出一个 dmg 而不用按架构分两份。
+    if platform.system() != 'Darwin':
+        raise SystemExit('macOS 核心需要在 macOS 上构建。')
     compiler = shutil.which('clang')
     if not compiler:
         raise SystemExit('需要安装 Xcode Command Line Tools。')
-    build('darwin', 'arm64' if platform.machine() == 'arm64' else 'amd64', compiler,
-          root / 'native' / 'build' / 'darwin' / 'libduanju_core.dylib')
+    # 与 macos/ 工程的 MACOSX_DEPLOYMENT_TARGET 保持一致，否则链接期会告警
+    # 「object file was built for newer macOS version than being linked」。
+    slices = []
+    for architecture, triple in [('arm64', 'arm64-apple-macos12.0'),
+                                 ('amd64', 'x86_64-apple-macos12.0')]:
+        library = root / 'native' / 'build' / 'darwin' / architecture / 'libduanju_core.dylib'
+        build('darwin', architecture, compiler, library, {
+            'CGO_CFLAGS': '-target ' + triple,
+            'CGO_LDFLAGS': '-target ' + triple,
+        })
+        slices.append(str(library))
+    output = root / 'native' / 'build' / 'darwin' / 'libduanju_core.dylib'
+    output.parent.mkdir(parents=True, exist_ok=True)
+    print('Building ' + str(output.relative_to(root)), flush=True)
+    subprocess.run(['lipo', '-create', *slices, '-output', str(output)], check=True)

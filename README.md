@@ -67,6 +67,7 @@ python3 scripts/build_web.py --edition quanjushijie   # 仅全剧视界版
 | Android 7.0+ | 三架构（arm64-v8a / armeabi-v7a / x86_64）APK；同一签名可覆盖升级，旧证书版本需卸载重装 |
 | Windows 10/11 x64 | 完整 ZIP 解压后运行 `duanjushijie.exe` / `quanjushijie.exe`，保留所有 DLL 与 `data`；局域网原生发现依赖 Windows 10 1903+。媒体层使用打过补丁的本地 `packages/media_kit_video`，修复切换视频或清晰度时的闪退（见下节） |
 | iOS 15.1+ | 已加入工程、Go 核心链接、媒体依赖、文件管理与构建脚本；iOS 播放页禁用 media_kit_video 硬件纹理加速以规避 libmpv 渲染崩溃；`CFBundleDisplayName` 使用英文 `DuanJuShijie` / `QuanJuShijie` 以通过 iloader 等侧载工具注册 App ID 时的名称校验，中文名写入 `zh-Hans.lproj/InfoPlist.strings`（开发快照，未经 Xcode 构建验证）；待 Xcode 构建与真机验收，无已签名 IPA |
+| macOS 12+ | `scripts/build_macos.py` 出通用 dmg（arm64 + x86_64，Apple 芯片与 Intel 都原生运行）。`macos/` 工程目录不入库，首次构建由 `flutter create --platforms=macos` 生成后再按变体改写 `PRODUCT_NAME` / bundle id；Go 核心编成通用 `libduanju_core.dylib` 放进 `Contents/Frameworks`，Dart 侧按路径 `dlopen`；关闭 App Sandbox（否则 release 包连不上任何站源）；ad-hoc 签名，未公证 |
 
 `INSTALL_FAILED_NO_MATCHING_ABIS` 表示 APK 与设备架构不匹配，请更换对应架构安装包。
 
@@ -74,15 +75,26 @@ python3 scripts/build_web.py --edition quanjushijie   # 仅全剧视界版
 
 工作流只能手动触发，推送和 PR 不再自动运行检查。
 
-发布流程：提升 `pubspec.yaml` 的 `version`，在 `CHANGELOG.md` 写好同名版本一节（标题如 `## 0.2.72+79`，会写入 Release 说明），推送到 `main`，再在 Actions 中手动运行 **Build app packages**（只能选 `main`）。工作流先检查版本：tag `app-v{version}`（`+` 替换为 `-`）或同名 Release 已存在时，直接失败，不进入构建。然后同时构建三个平台的两版（默认与 `--all-sources`）：
+发布流程：提升 `pubspec.yaml` 的 `version`，在 `CHANGELOG.md` 写好同名版本一节（标题如 `## 0.2.72+79`，会写入 Release 说明），推送到 `main` / `master`，再在 Actions 中手动运行 **Build app packages**。运行前有三个开关：
+
+| 开关 | 默认 | 作用 |
+| --- | --- | --- |
+| `with_ios` | 关 | 要不要出 iOS 包。macOS runner 按 10 倍分钟计费，Free 额度一个月只够跑一次，所以默认不出；Android / Windows / 网页版不受影响 |
+| `with_macos` | 关 | 要不要出 macOS dmg。同样走 macOS runner、同样 10 倍计费，所以单独一个开关，需要时再勾 |
+| `full_variants` | 关 | iOS / macOS 出几个版本。不勾只出全剧视界（`--all-sources`），勾上再补短剧视界，省一半 macOS 计费分钟 |
+| `republish` | 开 | 同一版本已有 Release / tag 时覆盖重发；取消勾选则直接失败，不进入构建 |
+
+然后构建四个平台的两版（默认与 `--all-sources`）：
 
 | 产物 | 内容 |
 | --- | --- |
 | `*-android` | 三种架构 APK，必须使用发布证书签名并通过指纹校验 |
 | `*-windows` | Windows x64 ZIP |
-| `*-ios-unsigned` | arm64 iPhone 未签名 IPA，下载后自行签名安装 |
+| `ios-unsigned` | arm64 iPhone 未签名 IPA，下载后自行签名安装（勾了 `with_ios` 才有） |
+| `macos` | 通用 dmg（arm64 + x86_64），ad-hoc 签名，未公证（勾了 `with_macos` 才有） |
+| `web` | `guoappweb.zip`，短剧视界 / 全剧视界 本地服务版合集 |
 
-checks（格式、分析、测试不阻塞）、Android、Windows、iOS 全部成功后才创建 tag 和 Release；任一平台失败就不发布。已有 Release 不会被覆盖。手动发布流程为开发快照，尚未完成首次运行验证。
+checks（格式、分析、测试不阻塞）、Android、Windows、网页版全部成功后才创建 Release；**iOS、macOS 跳过或失败只影响它们自己**，其余平台照常发布，Release 说明里会注明「本次未包含 iOS / macOS 包」或「只出了全剧视界」。重复发布时先删除同名 Release 与 tag 再按当前提交重建，删除失败则退化为覆盖同名资产。手动发布流程为开发快照，尚未完成首次运行验证。
 
 Android 签名只使用仓库 Secrets：`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`；同时需要配置仓库变量 `ANDROID_CERT_SHA256`（证书 SHA-256，冒号和大小写不限）。缺少任意一项都会发布失败。CI 通过环境变量把签名传给 Gradle；本机构建使用 `android/key.properties`。`key.properties` 和证书文件不入库。
 
@@ -126,7 +138,8 @@ Windows 桌面端此前的闪退有三个互不相干的根因，均已修复。
 Flutter `3.47.4`、Dart `3.12+`、Go `1.24.1+`、Python `3.10+`。
 Android 需要 JDK 17、SDK 36、NDK `28.2.13676358`；
 Windows 需要 Visual Studio C++ 桌面组件及 MinGW-w64 x64；
-iOS 需要 macOS、完整 Xcode 和 CocoaPods。
+iOS 需要 macOS、完整 Xcode 和 CocoaPods；
+macOS 需要 macOS 12+、Xcode Command Line Tools、CocoaPods（`brew install cocoapods`），dmg 排版额外建议 `pip install dmgbuild Pillow`（缺了只是退回普通 dmg）。
 
 构建脚本对子进程默认设置 `GOPROXY=https://goproxy.cn,direct`、`GOSUMDB=off`，同名环境变量可覆盖。
 
@@ -144,7 +157,13 @@ python3 scripts/build_ios.py --core-only [--simulator]
 python3 scripts/build_ios.py --export-options /path/to/ExportOptions.plist
 ~~~
 
-产物在 `dist/android`、`dist/windows`、`dist/ios`，短剧视界版以 `duanjushijie-` 开头，全剧视界版以 `quanjushijie-` 开头。
+~~~sh
+python3 scripts/build_macos.py                          # 短剧视界
+python3 scripts/build_macos.py --all-sources            # 全剧视界
+python3 scripts/build_macos.py --all-sources --cn-mirrors
+~~~
+
+产物在 `dist/android`、`dist/windows`、`dist/ios`、`dist/macos`，短剧视界版以 `duanjushijie-` 开头，全剧视界版以 `quanjushijie-` 开头。
 
 首次 Android 调试先编译对应架构核心，再运行：
 
@@ -178,6 +197,7 @@ go test -race -ldflags="-X duanjuapp/native/core.buildAllSources=true" ./...
 | `native/core`、`native/bridge` | 独立站源核心、缓存、下载、目录迁移及 C ABI |
 | `native/server` | 本地服务版（Go HTTP 服务 + 内嵌 web 前端，含直播代发），由 `scripts/build_web.py` 构建 |
 | `android`、`windows`、`ios` | 平台工程与必要资源 |
+| `macos` | 不入库：首次执行 `build_macos.py` 时由 `flutter create --platforms=macos` 生成，再按变体重写工程设置 |
 | `assets/video_enhancement`、`packages/media_kit_libs_windows_video`、`packages/media_kit_video` | 增强 Shader 与许可、固定 Windows 媒体依赖插件、打过 Windows 补丁的 `media_kit_video`（见「Windows 稳定性」） |
 | `scripts`、`.github/workflows` | 构建与发布 |
 | `test` | 自动化测试 |

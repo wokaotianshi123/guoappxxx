@@ -10,6 +10,9 @@ android/app/src/main/jniLibs/
 windows/runner/duanju_core.dll
 windows/runner/duanju_core.h
 ios/DuanjuCore/*.xcframework/
+# macOS 平台工程由 scripts/build_macos.py 首次构建时用 flutter create 生成，
+# 并按变体重写 PRODUCT_NAME / bundle id，属于构建期产物，不入库。
+macos/
 *.test
 *.out
 

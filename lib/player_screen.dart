@@ -483,7 +483,10 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   void _applyLifecycleVisibility({bool pauseWhenHidden = true}) {
-    final treatAsVisible = Platform.isWindows
+    // 桌面端（Windows / macOS）失焦时只会收到 inactive，不能据此暂停：
+    // 切到浏览器查个资料回来视频还在放才是桌面端该有的行为。
+    final desktop = Platform.isWindows || Platform.isMacOS;
+    final treatAsVisible = desktop
         ? (AppLifecycleState.resumed == _lifecycleState ||
               AppLifecycleState.inactive == _lifecycleState)
         : _lifecycleState == AppLifecycleState.resumed;
@@ -497,8 +500,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (pauseWhenHidden &&
         !visible &&
         (_lifecycleState == AppLifecycleState.paused ||
-            (!Platform.isWindows &&
-                _lifecycleState == AppLifecycleState.inactive) ||
+            (!desktop && _lifecycleState == AppLifecycleState.inactive) ||
             _lifecycleState == AppLifecycleState.hidden)) {
       _playIntent = false;
       unawaited(_player.pause());
@@ -1160,6 +1162,10 @@ class _PlayerScreenState extends State<PlayerScreen>
             await platform.setProperty('framedrop', 'vo');
           } else if (Platform.isWindows) {
             await platform.setProperty('hwdec', 'd3d11va-copy');
+          } else if (Platform.isMacOS) {
+            // 和 Windows 一样用 copy-back：media_kit_video 走纹理渲染，
+            // 需要把解出来的帧拷回内存，零拷贝模式拿不到帧。
+            await platform.setProperty('hwdec', 'videotoolbox-copy');
           }
           await platform.setProperty(
             'demuxer-lavf-o',
@@ -1316,7 +1322,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       _automaticFullscreenSuppressed = !fullscreen;
     });
     try {
-      if (Platform.isWindows) {
+      if (Platform.isWindows || Platform.isMacOS) {
         await windowManager.setFullScreen(fullscreen);
       } else if (_mobile) {
         await (_orientationController?.setPlayback(
@@ -1748,7 +1754,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         await _player.dispose();
       }),
     );
-    if (Platform.isWindows) {
+    if (Platform.isWindows || Platform.isMacOS) {
       unawaited(windowManager.setFullScreen(false));
     } else if (_mobile || _television && Platform.isAndroid) {
       unawaited(

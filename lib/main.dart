@@ -33,6 +33,17 @@ Future<void> main() async {
   if (Platform.isWindows) {
     await windowManager.ensureInitialized();
   }
+  if (Platform.isMacOS) {
+    // macOS 的窗口由 MainFlutterWindow 从 nib 里带出来，但 window_manager 要在
+    // 首帧前初始化好，否则「启动即显示」和初始尺寸都不生效。
+    await windowManager.ensureInitialized();
+    try {
+      await windowManager.waitUntilReadyToShow(
+        const WindowOptions(size: Size(1280, 800), center: true),
+        () async => windowManager.show(),
+      );
+    } catch (_) {}
+  }
   MediaKit.ensureInitialized();
   VideoEnhancementAssets.registerLicenses();
   final device = await AppDevice.detect();
