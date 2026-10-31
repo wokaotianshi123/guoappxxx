@@ -777,8 +777,9 @@ function defaultWatchIndex(dramaRef) {
 }
 
 // 中间选集区：当前集高亮，点击走就地换集（不销毁 <video>，倍速/全屏保留）。
-// 「倒序」开关只改变格子显示顺序（第 N 集→第 1 集 反向排列），
-// 格子的 data-index / href 仍指向真实集序，因此上一/下一集与自动连播不受影响。
+// 「倒序」开关改变格子显示顺序（第 N 集→第 1 集 反向排列），上一集/下一集/自动连播
+// 也按屏幕上的排列顺序走（见 episodeNextIndex/episodePrevIndex）；
+// 格子的 data-index / href 仍指向真实集序，换集后高亮与地址栏不会错位。
 function episodesGridInnerHTML() {
   var drama = state.drama;
   var chapters = state.chapters || [];
@@ -802,7 +803,7 @@ function episodesGridInnerHTML() {
     })
     .join('');
   var reversedToggle =
-    '<label class="toggle ep-reverse" title="选集列表倒序/正序展示，不影响下一集推进">' +
+    '<label class="toggle ep-reverse" title="选集列表倒序展示，上一集/下一集也按这个顺序走">' +
     '<input type="checkbox" id="episodes-reversed"' +
     (state.episodesReversed ? ' checked' : '') + '>倒序</label>';
   return (
@@ -990,15 +991,16 @@ function watchPageHTML(plan, index, message, kind) {
       .join('') +
     '</select></label>';
   var chapters = state.chapters || [];
-  var next = index + 1 < chapters.length ? '<button type="button" class="btn" id="episode-next">下一集</button>' : '';
-  var previous = index > 0 ? '<button type="button" class="btn" id="episode-previous">上一集</button>' : '';
+  // 三个控件一律渲染，可见性交给 syncEpisodeNav 按当前排列方向决定：
+  // 倒序时列表顶部是最后一集、原始第 1 集才是末尾，静态判断会判反。
+  var next = '<button type="button" class="btn" id="episode-next" style="display:none">下一集</button>';
+  var previous = '<button type="button" class="btn" id="episode-previous" style="display:none">上一集</button>';
   var favorite = isFavorite(state.drama)
     ? '<button type="button" class="btn active" id="fav-toggle">已收藏</button>'
     : '<button type="button" class="btn" id="fav-toggle">收藏</button>';
-  var autoNextBox = index + 1 < chapters.length
-    ? '<label class="toggle" title="播完自动跳到下一集">' +
-      '<input type="checkbox" id="auto-next"' + (state.autoNext ? ' checked' : '') + '>自动连播</label>'
-    : '';
+  var autoNextBox =
+    '<label class="toggle" title="播完自动跳到下一集" style="display:none">' +
+    '<input type="checkbox" id="auto-next"' + (state.autoNext ? ' checked' : '') + '>自动连播</label>';
   var adBlockBox = '<label class="toggle" title="播放前清洗 m3u8，剔除插播在时间线里的广告分片；关闭后加载原画">' +
     '<input type="checkbox" id="ad-block"' + (state.adBlock ? ' checked' : '') + '>去广告</label>';
   var playerWrap =
@@ -1145,6 +1147,8 @@ function renderWatch(id, index, source) {
           playPreviousEpisode();
         });
       }
+      // 进页时先按当前排列方向定好上一集/下一集/自动连播的可见性。
+      syncEpisodeNav(index);
       // 整页重建（换画质/线路）后，若进入本页前处于全屏，重新进全屏。
       // 就地换集（下一集/上一集/自动连播）不会走这里，全屏由 <video> 保留。
       restoreFullscreen();
@@ -1171,6 +1175,8 @@ function bindEpisodes() {
       state.episodesReversed = reversedToggle.checked;
       writeEpisodesReversed(state.episodesReversed);
       rerenderEpisodes();
+      // 排列方向变了，上一集/下一集的可见性要立刻跟着变。
+      syncEpisodeNav(state.index);
     });
   }
 }
@@ -1304,6 +1310,47 @@ function cancelAutoNext() {
 }
 
 // 换集时同步标题与上一集/下一集按钮状态，并让地址栏跟上（不触发整页重建）。
+// 选集排列方向：倒序打开时屏幕上是「最后一集 → 第 1 集」，上一集/下一集
+// 也按屏幕顺序走，否则点「下一集」会跳到列表另一端，看着像乱序。
+function episodeStep() {
+  return state.episodesReversed ? -1 : 1;
+}
+
+// 当前排列下「下一个」格子的真实集索引；越界返回 -1。
+function episodeNextIndex(index) {
+  var total = (state.chapters || []).length;
+  var next = index + episodeStep();
+  return next >= 0 && next < total ? next : -1;
+}
+
+// 当前排列下「上一个」格子的真实集索引；越界返回 -1。
+function episodePrevIndex(index) {
+  var total = (state.chapters || []).length;
+  var prev = index - episodeStep();
+  return prev >= 0 && prev < total ? prev : -1;
+}
+
+// 上一集/下一集/自动连播三个控件的可见性，统一跟着排列方向走。
+function syncEpisodeNav(index) {
+  var nextIndex = episodeNextIndex(index);
+  var prevIndex = episodePrevIndex(index);
+  var next = document.getElementById('episode-next');
+  if (next) {
+    next.disabled = nextIndex < 0;
+    next.style.display = nextIndex >= 0 ? '' : 'none';
+  }
+  var previous = document.getElementById('episode-previous');
+  if (previous) {
+    previous.disabled = prevIndex < 0;
+    previous.style.display = prevIndex >= 0 ? '' : 'none';
+  }
+  // 自动连播开关跟着「还有没有下一集」走：倒序时原始第 1 集才是末尾。
+  var autoNext = document.getElementById('auto-next');
+  if (autoNext && autoNext.parentNode) {
+    autoNext.parentNode.style.display = nextIndex >= 0 ? '' : 'none';
+  }
+}
+
 function syncEpisodeChrome(index) {
   var drama = state.drama;
   var chapters = state.chapters || [];
@@ -1311,24 +1358,8 @@ function syncEpisodeChrome(index) {
   if (title && drama) {
     title.textContent = drama.title + ' · ' + ((chapters[index] || {}).title || '');
   }
-  var next = document.getElementById('episode-next');
-  if (next && drama) {
-    if (index + 1 < chapters.length) {
-      next.disabled = false;
-      next.style.display = '';
-    } else {
-      next.style.display = 'none';
-    }
-  }
-  var previous = document.getElementById('episode-previous');
-  if (previous && drama) {
-    if (index > 0) {
-      previous.disabled = false;
-      previous.style.display = '';
-    } else {
-      previous.style.display = 'none';
-    }
-  }
+  // 上一集/下一集按当前排列方向决定能不能点。
+  syncEpisodeNav(index);
   var hash = drama ? episodeHash(drama.id, drama.source, index) : '';
   if (hash && location.hash !== hash) {
     // 只改地址栏，并标记本次 hashchange 不重建页面（就地换集复用同一个 <video>）。
@@ -1343,9 +1374,10 @@ function syncEpisodeChrome(index) {
 function playNextEpisode() {
   var drama = state.drama;
   var chapters = state.chapters || [];
-  var nextIndex = state.index + 1;
+  // 倒序时「下一集」是原始集序的上一集，所以用排列方向算，而不是 index + 1。
+  var nextIndex = episodeNextIndex(state.index);
   var video = document.getElementById('player');
-  if (!drama || nextIndex >= chapters.length) {
+  if (!drama || nextIndex < 0) {
     return Promise.resolve(false);
   }
   cancelAutoNext();
@@ -1392,7 +1424,7 @@ function playNextEpisode() {
 function playPreviousEpisode() {
   var drama = state.drama;
   var chapters = state.chapters || [];
-  var prevIndex = state.index - 1;
+  var prevIndex = episodePrevIndex(state.index);
   var video = document.getElementById('player');
   if (!drama || prevIndex < 0) {
     return Promise.resolve(false);
@@ -1438,10 +1470,9 @@ function playPreviousEpisode() {
 
 // 本集播完直接进下一集；已是最后一集或开关关闭时只做提示。
 function scheduleAutoNext() {
-  var chapters = state.chapters || [];
-  var nextIndex = state.index + 1;
-  if (!state.drama || nextIndex >= chapters.length) {
-    showNotice('已经是最后一集了。');
+  var nextIndex = episodeNextIndex(state.index);
+  if (!state.drama || nextIndex < 0) {
+    showNotice('已经没有下一集了。');
     return;
   }
   if (!state.autoNext) {
