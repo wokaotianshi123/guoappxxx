@@ -427,6 +427,16 @@ func (d *Downloader) fetchProviderText(ctx context.Context, rawURL, referer stri
 				req.Header.Set("Referer", referer)
 			}
 			req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+			// 自定义源（XBPQ 头部集合 / 播放请求头）附加头：放在内置头之后 Set，
+			// 同名键以规则为准（Authorization / Cookie / 自定义 Referer 都走这里）。
+			if extra, ok := ctx.Value(providerTextHeadersKey{}).(map[string]string); ok {
+				for name, value := range extra {
+					if name == "" || value == "" {
+						continue
+					}
+					req.Header.Set(name, value)
+				}
+			}
 			if noCache, _ := ctx.Value(providerTextNoCacheKey{}).(bool); noCache {
 				req.Header.Set("Cache-Control", "no-cache")
 			}

@@ -180,6 +180,28 @@ func (registry *customMaccmsRegistry) remove(id string) error {
 	return registry.save()
 }
 
+// updateRule 只替换规则正文并落盘，不动名称/地址/类型。
+// 供令牌自动续期等运行期规则修正使用（走 replace 会因 base 校验或 ID 重算失败）。
+func (registry *customMaccmsRegistry) updateRule(id, rule string) error {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	id = strings.TrimSpace(id)
+	record, found := registry.sources[id]
+	if !found {
+		return errors.New("自定义源不存在")
+	}
+	rule = strings.TrimSpace(rule)
+	if rule == "" {
+		return errors.New("规则内容为空")
+	}
+	if len(rule) > customSourceMaxBytes {
+		return errors.New("规则内容过大（上限 256KB）")
+	}
+	record.Rule = rule
+	registry.sources[id] = record
+	return registry.save()
+}
+
 func (registry *customMaccmsRegistry) replace(id, name, base, rule, kind string) error {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()

@@ -15,6 +15,11 @@ import (
 type providerTextUserAgentKey struct{}
 type providerTextNoCacheKey struct{}
 
+// providerTextHeadersKey 让调用方（目前是 XBPQ 自定义源的 头部集合/播放请求头）
+// 给页面抓取附加自定义请求头。抓取侧只会 Set 这些键，不会清掉内置的
+// UA / Referer / Accept-Language，因此同名键由这里覆盖。
+type providerTextHeadersKey struct{}
+
 var webProviderNumericID = regexp.MustCompile(`^[1-9][0-9]{0,17}$`)
 
 func webProviderInteger(value any, maximum int) (int, bool) {

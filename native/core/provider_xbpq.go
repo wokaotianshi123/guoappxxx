@@ -234,6 +234,115 @@ func (r xbpqRule) userAgent() string {
 	return value
 }
 
+// ---- 自定义请求头 ----
+//
+// 规则字段（与 XBPQ jar、wrxbpq 写源工具的字段字典一致）：
+//
+//	头部集合   Key$Value#Key$Value   站点所有页面请求附加头（Authorization / Cookie / Referer …）
+//	播放请求头  同上                   取直链与播放阶段专用，同名键覆盖 头部集合
+//
+// 分隔符兼容：# 或换行或 ||；键值兼容 $ : = 三种写法。不含分隔符的裸串
+// （例如直接把 UA 写进 头部集合）会被忽略，UA 仍由 请求头 字段负责。
+
+var xbpqHeaderLineBreak = strings.NewReplacer("\r\n", "#", "\n", "#", "||", "#")
+
+// xbpqValidHeaderName 头名必须是合法 token（字母数字与 -_），用来在 $ : = 三种
+// 键值写法里挑对分隔符——否则 "Referer=https://a.test/" 会被冒号误切成
+// name="Referer=https"。
+func xbpqValidHeaderName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func xbpqParseHeaderSet(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	headers := map[string]string{}
+	for _, entry := range strings.Split(xbpqHeaderLineBreak.Replace(raw), "#") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		var name, value string
+		found := false
+		for _, separator := range []string{"$", "：", ":", "="} {
+			head, tail, ok := strings.Cut(entry, separator)
+			if !ok || !xbpqValidHeaderName(strings.TrimSpace(head)) {
+				continue
+			}
+			name, value, found = head, tail, true
+			break
+		}
+		if !found {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > 2048 {
+			continue
+		}
+		if strings.ContainsAny(value, "\r\n\x00") {
+			continue
+		}
+		headers[http.CanonicalHeaderKey(name)] = value
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	return headers
+}
+
+// headerSet 站点级附加头（头部集合 / 请求头集合 / Headers）。
+func (r xbpqRule) headerSet() map[string]string {
+	return xbpqParseHeaderSet(r.field("头部集合", "请求头集合", "Headers"))
+}
+
+// playHeaderSet 播放阶段附加头：头部集合 + 播放请求头合并，后者优先。
+func (r xbpqRule) playHeaderSet() map[string]string {
+	site := r.headerSet()
+	play := xbpqParseHeaderSet(r.field("播放请求头", "播放头部集合"))
+	if len(site) == 0 && len(play) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(site)+len(play))
+	for name, value := range site {
+		merged[name] = value
+	}
+	for name, value := range play {
+		merged[name] = value
+	}
+	return merged
+}
+
+// xbpqHeaderValue 大小写不敏感取某个头。
+func xbpqHeaderValue(headers map[string]string, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			return value
+		}
+	}
+	return ""
+}
+
+// xbpqPlayReferer 播放阶段的 Referer：规则写了就用规则的，否则回落默认值。
+func xbpqPlayReferer(rule xbpqRule, fallback string) string {
+	if value := xbpqHeaderValue(rule.playHeaderSet(), "Referer"); value != "" {
+		return value
+	}
+	return fallback
+}
+
 // ---- 截取引擎 ----
 
 type xbpqStep struct {
@@ -1111,6 +1220,11 @@ var xbpqCharsetPattern = regexp.MustCompile(`(?i)charset\s*=\s*["' ]?(gbk|gb2312
 // xbpqFetch 按规则抓取页面文本：自定义 UA、GBK 转码、POST 支持。
 // spec 形如 url;post;body 或 url;get 时取第一段为 URL，第二段为 post 则发 POST。
 func (d *Downloader) xbpqFetch(ctx context.Context, raw, referer, agent string) (string, error) {
+	return d.xbpqFetchWithHeaders(ctx, raw, referer, agent, nil)
+}
+
+// xbpqFetchWithHeaders 在 xbpqFetch 基础上附加规则里的 头部集合/播放请求头。
+func (d *Downloader) xbpqFetchWithHeaders(ctx context.Context, raw, referer, agent string, headers map[string]string) (string, error) {
 	address, method, body := xbpqSplitSpec(raw)
 	if address == "" {
 		return "", fmt.Errorf("规则地址为空")
@@ -1118,6 +1232,9 @@ func (d *Downloader) xbpqFetch(ctx context.Context, raw, referer, agent string) 
 	if method == "" {
 		if agent = strings.TrimSpace(agent); agent != "" {
 			ctx = context.WithValue(ctx, providerTextUserAgentKey{}, agent)
+		}
+		if len(headers) > 0 {
+			ctx = context.WithValue(ctx, providerTextHeadersKey{}, headers)
 		}
 		payload, err := d.fetchProviderText(ctx, address, referer)
 		if err != nil {
@@ -1130,7 +1247,7 @@ func (d *Downloader) xbpqFetch(ctx context.Context, raw, referer, agent string) 
 		Address: address,
 		Referer: referer,
 		Agent:   xbpqAgent(agent),
-		Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+		Headers: xbpqMergeHeaders(headers, map[string]string{"Content-Type": "application/x-www-form-urlencoded"}),
 		Body:    []byte(body),
 	}
 	payload, err := d.duanjuDo(ctx, request)
@@ -1145,6 +1262,20 @@ func xbpqAgent(agent string) string {
 		return agent
 	}
 	return duanjuUserAgent
+}
+
+// xbpqMergeHeaders 合并多组请求头，后面的覆盖前面的；全空返回 nil。
+func xbpqMergeHeaders(groups ...map[string]string) map[string]string {
+	var merged map[string]string
+	for _, group := range groups {
+		for name, value := range group {
+			if merged == nil {
+				merged = map[string]string{}
+			}
+			merged[name] = value
+		}
+	}
+	return merged
 }
 
 // xbpqSplitSpec 解析 `url;post;body` / `url;get` 形态。
@@ -1201,7 +1332,7 @@ type xbpqItem struct {
 }
 
 func (d *Downloader) xbpqExtractItems(ctx context.Context, rule xbpqRule, base, pageURL, prefix string) ([]xbpqItem, error) {
-	body, err := d.xbpqFetch(ctx, pageURL, base+"/", rule.userAgent())
+	body, err := d.xbpqFetchWithHeaders(ctx, pageURL, base+"/", rule.userAgent(), rule.headerSet())
 	if err != nil {
 		// 抓取失败（403/超时/DNS）必须原样上抛：否则会被上层统一报成
 		// 「未抽取到列表条目」，让用户误以为规则写错，排查方向被带偏。
@@ -1655,7 +1786,7 @@ func (d *Downloader) xbpqDetail(ctx context.Context, source, base, sourceID stri
 	if pageURL == "" {
 		return Drama{}, nil, fmt.Errorf("无法定位详情页地址")
 	}
-	body, err := d.xbpqFetch(ctx, pageURL, base+"/", rule.userAgent())
+	body, err := d.xbpqFetchWithHeaders(ctx, pageURL, base+"/", rule.userAgent(), rule.headerSet())
 	if err != nil {
 		return Drama{}, nil, err
 	}
@@ -1904,10 +2035,30 @@ func xbpqAlternateRoutes(groups [][]xbpqEpisode, index, mainCount int, main xbpq
 // xbpqResolvePage 播放页取直链：跳转播放链接模板 → 标准 player_data → MacCMS 嗅探兜底。
 // 多线路：主线路成功后并发解析其余线路填入 Variants（播放时可切换）；
 // 主线路失败则依次尝试其它线路，第一个成功的顶上。
+// xbpqResolveMedia 取直链。解析失败且规则配了刷新令牌时，自动换新令牌重试一次
+// （令牌过期是这类接口源最常见、也最容易自动修复的失败原因）。
 func (d *Downloader) xbpqResolveMedia(ctx context.Context, task Task, rule xbpqRule, base, name string) (providerMedia, error) {
+	media, err := d.xbpqResolveMediaOnce(ctx, task, rule, base, name)
+	if err == nil {
+		return media, nil
+	}
+	refreshed, ok := d.xbpqRefreshAccessToken(ctx, task.Chapter.Source, rule, base)
+	if !ok {
+		return providerMedia{}, err
+	}
+	if retried, retryErr := d.xbpqResolveMediaOnce(ctx, task, refreshed, base, name); retryErr == nil {
+		return retried, nil
+	}
+	return providerMedia{}, err
+}
+
+func (d *Downloader) xbpqResolveMediaOnce(ctx context.Context, task Task, rule xbpqRule, base, name string) (providerMedia, error) {
 	pageURL := strings.TrimSpace(task.Chapter.PageURL)
 	address := strings.TrimSpace(task.Chapter.VideoURL)
 	referer := firstNonEmpty(task.Chapter.Referer, base+"/")
+	// 规则写了 播放请求头/头部集合 的 Referer 时以规则为准：不少站点（如接口型
+	// 采集站）要求固定站点 Referer，章节自带的播放页 Referer 反而会被拒。
+	referer = xbpqPlayReferer(rule, referer)
 	if isProviderHTTPMediaURL(address) && duanjuLooksLikeMedia(address) {
 		media, err := d.prepareWebProviderMedia(ctx, providerMedia{URL: address, Referer: referer}, name)
 		if err == nil {
@@ -1937,20 +2088,23 @@ func (d *Downloader) xbpqResolveMedia(ctx context.Context, task Task, rule xbpqR
 
 // xbpqResolveOne 单个播放页取直链。
 func (d *Downloader) xbpqResolveOne(ctx context.Context, pageURL, referer string, rule xbpqRule, name string) (providerMedia, error) {
-	body, err := d.xbpqFetch(ctx, pageURL, referer, rule.userAgent())
+	playHeaders := rule.playHeaderSet()
+	body, err := d.xbpqFetchWithHeaders(ctx, pageURL, referer, rule.userAgent(), playHeaders)
 	if err != nil {
 		return providerMedia{}, err
 	}
+	// 交给播放器的 Referer：规则指定优先，否则用播放页地址（CDN 只认有 Referer 的站）。
+	mediaReferer := xbpqPlayReferer(rule, pageURL)
 	if jump := rule.field("跳转播放链接"); jump != "" {
 		for _, candidate := range xbpqJumpCandidates(body, jump) {
 			candidate = xbpqJoinLink(pageURL, candidate)
 			candidate = maccmsNormalizePlaybackURL(candidate)
 			if isProviderHTTPMediaURL(candidate) && duanjuLooksLikeMedia(candidate) {
-				return d.prepareWebProviderMedia(ctx, providerMedia{URL: candidate, Referer: pageURL}, name)
+				return d.prepareWebProviderMedia(ctx, providerMedia{URL: candidate, Referer: mediaReferer}, name)
 			}
 			if strings.HasPrefix(candidate, "http") && !duanjuLooksLikeMedia(candidate) {
 				// 跳转到二级播放页：再取一次
-				if second, secondErr := d.xbpqFetch(ctx, candidate, pageURL, rule.userAgent()); secondErr == nil {
+				if second, secondErr := d.xbpqFetchWithHeaders(ctx, candidate, pageURL, rule.userAgent(), playHeaders); secondErr == nil {
 					if direct := xbpqJumpValue(second, jump); direct != "" {
 						direct = maccmsNormalizePlaybackURL(direct)
 						if isProviderHTTPMediaURL(direct) {
@@ -1964,10 +2118,10 @@ func (d *Downloader) xbpqResolveOne(ctx context.Context, pageURL, referer string
 	if media := maccmsPlayerURL(body); media != "" {
 		media = maccmsNormalizePlaybackURL(media)
 		if isProviderHTTPMediaURL(media) {
-			return d.prepareWebProviderMedia(ctx, providerMedia{URL: media, Referer: pageURL}, name)
+			return d.prepareWebProviderMedia(ctx, providerMedia{URL: media, Referer: mediaReferer}, name)
 		}
 		if parsed := d.resolveMaccmsCloudParse(ctx, body, media, pageURL); parsed != "" {
-			return d.prepareWebProviderMedia(ctx, providerMedia{URL: maccmsNormalizePlaybackURL(parsed), Referer: pageURL}, name)
+			return d.prepareWebProviderMedia(ctx, providerMedia{URL: maccmsNormalizePlaybackURL(parsed), Referer: mediaReferer}, name)
 		}
 	}
 	return providerMedia{}, fmt.Errorf("%s未解析到播放地址", name)
@@ -2007,7 +2161,7 @@ func (d *Downloader) xbpqResolveRoutes(ctx context.Context, routes []string, rul
 			case <-ctx.Done():
 				return
 			}
-			got, err := d.xbpqResolveOne(ctx, u, base+"/", rule, name)
+			got, err := d.xbpqResolveOne(ctx, u, xbpqPlayReferer(rule, base+"/"), rule, name)
 			if err != nil || got.URL == "" {
 				return
 			}
