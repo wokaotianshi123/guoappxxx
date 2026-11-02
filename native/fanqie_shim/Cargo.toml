@@ -1,0 +1,30 @@
+[package]
+name = "fanqie_shim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C ABI bootstrap for the fqapi core loopback server (embedded in the fanqie app)"
+
+[lib]
+name = "fanqie_shim"
+# cdylib：Android（jniLibs 里直接加载）与 iOS（framework/dylib）用。
+# staticlib：iOS 走「静态库链进 Runner」时用，避免动态库签名问题。
+crate-type = ["cdylib", "staticlib"]
+
+# 独立可执行引擎：Windows / macOS / Linux 桌面端与本地服务版用它。
+# 走「独立进程 + loopback HTTP」的好处是不牵扯动态库的查找路径与代码签名，
+# Go 写的本地服务端也能直接拉起同一份引擎。
+[[bin]]
+name = "fanqie_engine"
+path = "src/main.rs"
+
+[dependencies]
+# 上游 GPL-3.0 的 Rust 核心（ch6vip/fqapp 的 rust/ 目录）。
+# 仓库里不内联这份源码：scripts/build_fanqie_engine.py 会按固定提交号拉取，
+# 并把本 crate 摆到 upstream 的 native/ 下，所以这里的相对路径与上游仓库一致。
+fqapi_core = { path = "../fqapp/rust" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+[profile.release]
+strip = true
+lto = false

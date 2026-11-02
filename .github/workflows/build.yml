@@ -117,6 +117,47 @@ jobs:
           echo "exists_tag=$exists_tag" >> "$GITHUB_OUTPUT"
           echo "exists_release=$exists_release" >> "$GITHUB_OUTPUT"
 
+  # 番茄内容引擎：上游 GPL-3.0 项目 ch6vip/fqapp 的 Rust 核心，按固定提交号
+  # 拉源码编译。Android 用的是仓库里预编译的 .so，桌面端与本地服务版则需要
+  # 各平台自己编一份：
+  #   * fanqie_engine：可执行，Windows / macOS / Linux 由宿主进程拉起；
+  #   * libfanqie_shim：Android 的 .so 与 iOS 的静态库。
+  # 这一步失败不拦发布——缺引擎的平台番茄源照样显示，只是播放时提示引擎未就绪。
+  engines:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: windows
+            arguments: ''
+          - runner: ubuntu-latest
+            platform: linux
+            arguments: ''
+          - runner: macos-latest
+            platform: macos
+            arguments: '--macos-universal'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Rust 交叉目标（macOS 通用二进制）
+        if: matrix.platform == 'macos'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: 编译番茄引擎
+        continue-on-error: true
+        run: python scripts/build_fanqie_engine.py --out build/fanqie/${{ matrix.platform }} ${{ matrix.arguments }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fanqie-engine-${{ matrix.platform }}
+          path: build/fanqie/${{ matrix.platform }}/*
+          if-no-files-found: warn
+          retention-days: 14
+
   android:
     needs: prepare
     runs-on: ubuntu-latest
@@ -283,12 +324,17 @@ jobs:
           retention-days: 14
 
   windows:
-    needs: prepare
+    needs: [prepare, engines]
     runs-on: windows-latest
     timeout-minutes: 45
     strategy: *editions
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: fanqie-engine-windows
+          path: build/fanqie/windows
       - *setup-go
       - *setup-python
       - *setup-flutter
@@ -345,6 +391,14 @@ jobs:
           go version
           flutter --version
           flutter precache --ios
+      # iOS 不能加载 App 包外的动态库、也不能 fork 子进程，所以番茄引擎编成
+      # 静态库链进 Runner。失败不拦出包：FanqieEngine.podspec 会跳过链接，
+      # 应用照常能装，只是番茄源会提示引擎未就绪。
+      - name: 编译番茄引擎静态库（iOS）
+        continue-on-error: true
+        run: |
+          rustup target add aarch64-apple-ios
+          python scripts/build_fanqie_engine.py --out ios/FanqieEngine --target aarch64-apple-ios
       - name: Build unsigned iOS packages (短剧视界)
         if: ${{ inputs.full_variants }}
         run: python scripts/build_ios.py
@@ -366,13 +420,18 @@ jobs:
   # （arm64 + x86_64）再 lipo 成通用 dylib，Xcode 侧 Release 也默认出通用二进制，
   # 所以只出一个 dmg，Intel 机器同样能原生跑。
   macos:
-    needs: prepare
+    needs: [prepare, engines]
     if: ${{ inputs.with_macos }}
     continue-on-error: true
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: fanqie-engine-macos
+          path: build/fanqie/macos
       - *setup-python
       - *setup-go
       - *setup-flutter
@@ -411,11 +470,28 @@ jobs:
           retention-days: 14
 
   web:
-    needs: prepare
+    needs: [prepare, engines]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # 本地服务版要带齐三个平台的番茄引擎；缺哪个平台就跳过哪个平台的引擎，
+      # 包仍然能出，只是那个平台的番茄源会提示引擎未就绪。
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: fanqie-engine-windows
+          path: build/fanqie/windows
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: fanqie-engine-linux
+          path: build/fanqie/linux
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: fanqie-engine-macos
+          path: build/fanqie/macos
       - *setup-go
       - *setup-python
       - name: Build local service edition (短剧视界 / 全剧视界)

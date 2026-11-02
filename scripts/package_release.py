@@ -33,6 +33,23 @@ def run(arguments, cwd=None):
     subprocess.run([str(item) for item in arguments], cwd=cwd, check=True)
 
 
+def fanqie_engine_binary(platform_name):
+    """取构建好的番茄内容引擎；没有产物时返回 None。
+
+    CI 里由 `scripts/build_fanqie_engine.py` 编好后放到 build/fanqie/<平台>/，
+    打包时随包分发。Dart 侧在主程序同级目录找它，所以放对位置即可。
+    """
+    directory = root / 'build' / 'fanqie' / platform_name
+    if not directory.is_dir():
+        return None
+    for name in ['fanqie_engine.exe', 'fanqie_engine']:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+
 def macho_architectures(path):
     result = subprocess.run(['lipo', '-info', str(path)], capture_output=True, text=True)
     if result.returncode != 0:
@@ -80,6 +97,13 @@ def sign_macos_application(application, identity):
         flags += ['--options', 'runtime', '--timestamp']
     for framework in sorted((application / 'Contents' / 'Frameworks').glob('*')):
         run(flags + [framework])
+    # Contents/MacOS 里的辅助可执行（番茄引擎）必须先单独签名：Apple 芯片上
+    # 未签名的 Mach-O 会被内核直接拒绝执行，而外层 app 的签名不会覆盖它。
+    info = plistlib.loads((application / 'Contents' / 'Info.plist').read_bytes())
+    main_executable = info.get('CFBundleExecutable', '')
+    for helper in sorted((application / 'Contents' / 'MacOS').iterdir()):
+        if helper.is_file() and helper.name != main_executable:
+            run(flags + [helper])
     run(flags + [application])
 
 
@@ -155,6 +179,14 @@ def package_macos(application):
     staging.mkdir(parents=True)
     staged = staging / f'{display}.app'
     shutil.copytree(application, staged, symlinks=True)
+    # 番茄内容引擎放进 Contents/MacOS，与主程序同级；签名在下面统一做。
+    fanqie_engine = fanqie_engine_binary('macos')
+    if fanqie_engine is not None:
+        destination = staged / 'Contents' / 'MacOS' / 'fanqie_engine'
+        shutil.copy2(fanqie_engine, destination)
+        os.chmod(destination, 0o755)
+    else:
+        print('未找到 macOS 版番茄引擎，本次包内不含引擎（番茄源仍会显示）。')
     plist_path = staged / 'Contents' / 'Info.plist'
     info = plistlib.loads(plist_path.read_bytes())
     info['CFBundleDisplayName'] = display
@@ -199,6 +231,13 @@ if options.platform == 'android':
         artifacts.append(target)
 elif options.platform == 'windows':
     bundle = root / 'build' / 'windows' / 'x64' / 'runner' / 'Release'
+    # 番茄内容引擎要和主程序同级，Dart 侧才找得到；缺产物时番茄源仍显示，
+    # 只是播放会提示引擎未就绪，因此这里不做硬性要求。
+    fanqie_engine = fanqie_engine_binary('windows')
+    if fanqie_engine is not None:
+        shutil.copy2(fanqie_engine, bundle / 'fanqie_engine.exe')
+    else:
+        print('未找到 Windows 版番茄引擎，本次包内不含引擎（番茄源仍会显示）。')
     required = ['quanjushijie.exe', 'duanju_core.dll', 'flutter_windows.dll', 'libffmpegkit.dll',
                 'libmpv-2.dll', 'msvcp140.dll', 'vcruntime140.dll',
                 'data/icudtl.dat', 'data/app.so']

@@ -23,6 +23,9 @@ flutter_ios_podfile_setup
 target 'Runner' do
   use_frameworks!
   pod 'DuanjuCore', :path => 'DuanjuCore'
+  # 番茄内容引擎（Rust 核心静态库）。产物由 scripts/build_fanqie_engine.py
+  # 编出；没有产物时 podspec 会自动跳过链接，不影响其它功能。
+  pod 'FanqieEngine', :path => 'FanqieEngine'
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   target 'RunnerTests' do
     inherit! :search_paths

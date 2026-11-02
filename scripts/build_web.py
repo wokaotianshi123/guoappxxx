@@ -297,6 +297,30 @@ def fetch_ffmpeg():
     raise SystemExit('所有 ffmpeg 下载源都失败，无法把 ffmpeg.exe 打进发布包。')
 
 
+def stage_fanqie_engine(staging):
+    """把各平台的番茄引擎复制进暂存目录。
+
+    产物由 `scripts/build_fanqie_engine.py` 在各自原生 runner 上编好后，
+    CI 会下载到 build/fanqie/<平台>/。缺哪个平台就跳过哪个——番茄源在那台
+    机器上仍然显示，只是播放时会提示引擎未就绪，其它站源不受影响。
+    """
+    engines = root / 'build' / 'fanqie'
+    plan = [
+        ('windows', 'fanqie_engine.exe', 'fanqie_engine-windows.exe'),
+        ('linux', 'fanqie_engine', 'fanqie_engine-linux'),
+        ('macos', 'fanqie_engine', 'fanqie_engine-macos-arm'),
+        ('macos', 'fanqie_engine', 'fanqie_engine-macos-intel'),
+    ]
+    for platform_name, source_name, target_name in plan:
+        source = engines / platform_name / source_name
+        if not source.is_file():
+            print('未找到 ' + platform_name + ' 版番茄引擎，本次包内不含该平台引擎。')
+            continue
+        target = staging / target_name
+        shutil.copy2(source, target)
+        target.chmod(0o755)
+
+
 def package_edition(slug):
     output = root / 'dist' / 'web'
     output.mkdir(parents=True, exist_ok=True)
@@ -311,6 +335,9 @@ def package_edition(slug):
         target.chmod(0o755)
         # 暂存目录里已经有一份，删掉平铺的那份，四个平台加起来能省近百 MB 磁盘。
         source.unlink(missing_ok=True)
+    # 番茄内容引擎随包分发：本地服务版会拉起它，番茄站源才能真正出内容。
+    # 四个平台的二进制平铺在一个目录里，所以引擎带平台后缀避免同名冲突。
+    stage_fanqie_engine(staging)
     # 直接用字节写入，避免 Windows 上把 LF 二次转换成 CR CR LF。
     # start.bat 用 GBK：cmd.exe 按系统 ANSI 代码页读批处理，中文 Windows 上才不会乱码。
     (staging / 'start.sh').write_bytes(start_script(slug).encode('utf-8'))

@@ -50,3 +50,7 @@ Thumbs.db
 desktop.ini
 
 /CLAUDE.md
+
+# iOS 的番茄引擎静态库由 CI 现编（scripts/build_fanqie_engine.py），不入库。
+ios/FanqieEngine/libfanqie_shim.a
+native/fanqie_shim/target/

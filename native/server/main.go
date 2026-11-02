@@ -992,6 +992,10 @@ func main() {
 	if err := json.Unmarshal([]byte(core.NativeRequest(string(encoded))), &answer); err != nil || !answer.OK {
 		log.Fatalf("本地核心初始化失败：%s", answer.Error)
 	}
+	// 番茄站源依赖本机的 Rust 引擎；随包没有引擎产物时这里静默跳过，
+	// 番茄源仍会列出，播放时给出「引擎未就绪」的提示，其余站源不受影响。
+	stopFanqieEngine := startFanqieEngine(directory)
+	defer stopFanqieEngine()
 
 	site, err := fs.Sub(webAssets, "web")
 	if err != nil {
