@@ -90,7 +90,9 @@ func fanqieOfflineHint(err error) error {
 		"积极拒绝",
 	} {
 		if strings.Contains(lower, marker) {
-			return fmt.Errorf("番茄内容引擎未就绪（本机 %s）：Android 版已内置引擎，桌面端/本地服务器端需先启动番茄引擎", fanqieEngineAddress)
+			// 把原始错误一起带上：光说「未就绪」在真机上没法判断到底是引擎没起来、
+			// 端口被占、还是请求被服务端拒了。URL 出口会做脱敏，这里用无 scheme 的地址。
+			return fmt.Errorf("番茄内容引擎未就绪（本机 %s）：%v", fanqieEngineAddress, err)
 		}
 	}
 	return err

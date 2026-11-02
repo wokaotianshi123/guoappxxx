@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 
@@ -96,11 +97,52 @@ class FanqieBackend {
     return _ready;
   }
 
+  /// 现查一次引擎状态：端口能不能连、能不能真的应答 /health。
+  ///
+  /// [diagnosis] 只是「上次记录」：引擎中途挂掉时它会撒谎（报「已就绪」但请求
+  /// 全失败）。出错时用这个现查，并把 /health 的结果带出来——端口在听但不应答，
+  /// 和端口根本没起，是两种完全不同的病。
+  static Future<String> describeNow() async {
+    if (!_started) return '引擎未启动';
+    if (!await _portOpen()) {
+      return _failure ?? '引擎没有在 127.0.0.1:$port 监听（已退出或还没起来）';
+    }
+    final health = await _healthLine();
+    // /health 不是 2xx 或直接失败时，把引擎日志最后一行也贴出来——Rust 里的
+    // panic 只写在这个文件里（安卓没有 logcat 权限）。
+    final tail = health.startsWith('/health 2') ? null : _logTail();
+    final detail = tail == null ? health : '$health；引擎日志：$tail';
+    final failure = _failure;
+    if (failure != null) return '$failure；端口在听，$detail';
+    return '端口在听，$detail';
+  }
+
+  /// 打一次引擎自己的健康检查，返回一句可直接写进日志/提示的话。
+  static Future<String> _healthLine() async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+    try {
+      final request =
+          await client.getUrl(Uri.parse('http://127.0.0.1:$port/health'));
+      final response = await request.close().timeout(const Duration(seconds: 3));
+      final body =
+          await response.transform(const Utf8Decoder(allowMalformed: true)).join();
+      final trimmed = body.trim();
+      final short = trimmed.length > 120 ? '${trimmed.substring(0, 120)}…' : trimmed;
+      return '/health ${response.statusCode} $short';
+    } catch (error) {
+      return '/health 请求失败：$error';
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   static void _markReady() {
     if (_ready) return;
     _ready = true;
     _failure = null;
     DiaryService.add('[fanqie] 内容引擎就绪 (127.0.0.1:$port)');
+    // 端口在听不等于引擎真能干活，立刻打一次 /health 把结论留在日记里。
+    unawaited(_healthLine().then((line) => DiaryService.add('[fanqie] 就绪探测 $line')));
   }
 
   /// 记录失败原因，并尽量带上引擎自己写的日志尾巴。
@@ -108,25 +150,28 @@ class FanqieBackend {
   /// 安卓上开发者拿不到 logcat（READ_LOGS 是系统权限），引擎的 panic / 初始化
   /// 失败只会落在运行目录的 `fanqie_engine.log` 里；把它最后一行并进错误信息，
   /// 用户截图或「设置 → 日记」就能直接看到现场。
-  static void _fail(String reason) {
-    var text = reason;
+  static String? _logTail() {
     final dir = _runtimeDir;
-    if (dir != null) {
-      try {
-        final file = File(path.join(dir, 'fanqie_engine.log'));
-        if (file.existsSync()) {
-          final lines = file
-              .readAsStringSync()
-              .split('\n')
-              .map((line) => line.trim())
-              .where((line) => line.isNotEmpty)
-              .toList();
-          if (lines.isNotEmpty) text = '$reason；引擎日志：${lines.last}';
-        }
-      } catch (_) {
-        // 日志读不到不影响失败原因本身。
-      }
+    if (dir == null) return null;
+    try {
+      final file = File(path.join(dir, 'fanqie_engine.log'));
+      if (!file.existsSync()) return null;
+      final lines = file
+          .readAsStringSync()
+          .split('\n')
+          .map((line) => line.trim())
+          .where((line) => line.isNotEmpty)
+          .toList();
+      return lines.isEmpty ? null : lines.last;
+    } catch (_) {
+      // 日志读不到不影响失败原因本身。
+      return null;
     }
+  }
+
+  static void _fail(String reason) {
+    final tail = _logTail();
+    final text = tail == null ? reason : '$reason；引擎日志：$tail';
     _failure = text;
     DiaryService.add('[fanqie] $text');
   }

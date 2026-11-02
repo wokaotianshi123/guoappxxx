@@ -104,6 +104,11 @@ func TestFanqieOfflineHintGuidesUser(t *testing.T) {
 		if !strings.Contains(err.Error(), "18921") {
 			t.Fatalf("%s: hint should mention the engine port, got %v", name, err)
 		}
+		// 原始错误必须保留：真机上只看「未就绪」永远查不出是没起来、被拒还是
+		// 引擎中途挂了。
+		if !strings.Contains(err.Error(), cause.Error()) {
+			t.Fatalf("%s: hint should keep the original error, got %v", name, err)
+		}
 	}
 	// 引擎活着但返回业务错误时，不能被误译成「未就绪」。
 	real := errors.New("番茄引擎错误 500: upstream busy")
@@ -113,7 +118,7 @@ func TestFanqieOfflineHintGuidesUser(t *testing.T) {
 	// 错误出口会做 URL 脱敏（https?://[^\s"'<>]+ 会连后面中文一起吞掉），
 	// 所以提示里不能带 scheme，否则用户只能看到半截话。
 	surfaced := publicError(fanqieOfflineHint(errFanqieRustStub{})).Error()
-	if !strings.Contains(surfaced, "Android") || !strings.Contains(surfaced, "18921") {
+	if !strings.Contains(surfaced, "未就绪") || !strings.Contains(surfaced, "18921") {
 		t.Fatalf("hint must survive URL redaction intact, got %q", surfaced)
 	}
 	if strings.Contains(surfaced, "http://") {
