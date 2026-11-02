@@ -27,6 +27,30 @@ import time
 import urllib.request
 from pathlib import Path
 
+
+def ensure_printable_stdio():
+    """让 stdout/stderr 至少能写出中文。
+
+    CI 的 Windows runner 上 Python 按系统 ANSI 代码页取 stdout 编码（cp1252），
+    脚本里任何一句中文 print 都会直接 ``UnicodeEncodeError`` 把构建打断——本地
+    中文 Windows（cp936）反而看不出问题。这里只在当前编码表达不了中文时才切
+    UTF-8，本机 GBK 控制台维持原样，不会被改出一屏乱码。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        encoding = getattr(stream, 'encoding', None) or 'utf-8'
+        try:
+            '番茄'.encode(encoding)
+        except (UnicodeEncodeError, LookupError):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except (AttributeError, ValueError):
+                pass
+
+
+ensure_printable_stdio()
+
 # 固定提交号：上游 master 随时会变，出包必须可复现。
 UPSTREAM_REPO = 'ch6vip/fqapp'
 UPSTREAM_COMMIT = 'aabde536c8621092f13b1a95f52e631b189f9243'

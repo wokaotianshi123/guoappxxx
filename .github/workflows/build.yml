@@ -33,6 +33,10 @@ concurrency:
 env:
   GOPROXY: https://proxy.golang.org,direct
   GOSUMDB: sum.golang.org
+  # Windows runner 的 Python 默认按系统 ANSI 代码页（cp1252）打 stdout，
+  # 脚本里一句中文 print 就会 UnicodeEncodeError 直接打断构建。这里统一强制
+  # UTF-8；脚本自身也有兜底（scripts/build_fanqie_engine.py 的 ensure_printable_stdio）。
+  PYTHONIOENCODING: utf-8
 
 jobs:
   checks:
@@ -76,8 +80,23 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       exists_tag: ${{ steps.version.outputs.exists_tag }}
       exists_release: ${{ steps.version.outputs.exists_release }}
+      engine_matrix: ${{ steps.engines.outputs.engine_matrix }}
     steps:
       - uses: actions/checkout@v4
+      - id: engines
+        env:
+          INPUT_WITH_MACOS: ${{ inputs.with_macos }}
+        run: |
+          set -euo pipefail
+          # 番茄引擎的构建矩阵：Windows / Linux 常驻，macOS 那一格只在真出
+          # macOS 包时才加。macOS runner 按 10 倍分钟计费，没勾 with_macos
+          # 却先白烧一台苹果机器编引擎（而产物根本没人用）最不划算。
+          entries='{"runner":"windows-latest","platform":"windows","arguments":""}'
+          entries="$entries"',{"runner":"ubuntu-latest","platform":"linux","arguments":""}'
+          if [ "${INPUT_WITH_MACOS:-false}" = "true" ]; then
+            entries="$entries"',{"runner":"macos-latest","platform":"macos","arguments":"--macos-universal"}'
+          fi
+          echo "engine_matrix=[$entries]" >> "$GITHUB_OUTPUT"
       - id: version
         env:
           GH_TOKEN: ${{ github.token }}
@@ -123,21 +142,13 @@ jobs:
   #   * fanqie_engine：可执行，Windows / macOS / Linux 由宿主进程拉起；
   #   * libfanqie_shim：Android 的 .so 与 iOS 的静态库。
   # 这一步失败不拦发布——缺引擎的平台番茄源照样显示，只是播放时提示引擎未就绪。
+  # 要编哪些平台由 prepare 算出来的矩阵决定：macOS 只在勾了 with_macos 时才有。
   engines:
     needs: prepare
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: windows-latest
-            platform: windows
-            arguments: ''
-          - runner: ubuntu-latest
-            platform: linux
-            arguments: ''
-          - runner: macos-latest
-            platform: macos
-            arguments: '--macos-universal'
+        include: ${{ fromJSON(needs.prepare.outputs.engine_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -487,11 +498,17 @@ jobs:
         with:
           name: fanqie-engine-linux
           path: build/fanqie/linux
+      # macOS 引擎只在勾了 with_macos 时才编（见 prepare 算的矩阵），这里跟着
+      # 开关走，免得平白多出一条「artifact 不存在」的红色报错。
       - uses: actions/download-artifact@v4
+        if: ${{ inputs.with_macos }}
         continue-on-error: true
         with:
           name: fanqie-engine-macos
           path: build/fanqie/macos
+      - name: 提示本包不含 macOS 引擎
+        if: ${{ !inputs.with_macos }}
+        run: echo "::warning::未勾选 with_macos，本地服务版 zip 内不含 macOS 版番茄引擎；macOS 上跑本地服务版时番茄源会提示引擎未就绪。要连 macOS 引擎一起打，勾 with_macos 重跑。"
       - *setup-go
       - *setup-python
       - name: Build local service edition (短剧视界 / 全剧视界)
