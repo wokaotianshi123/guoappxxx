@@ -367,6 +367,13 @@ class NativeRepository extends AppRepository {
     );
   }
 
+  /// 这个请求是不是要打番茄站源（目录/分类带 source，详情/取流带 drama）。
+  bool _targetsFanqie(Map<String, dynamic> input) {
+    if (input['source'] == 'fanqie') return true;
+    final drama = input['drama'];
+    return drama is Map && drama['source'] == 'fanqie';
+  }
+
   Future<Map<String, dynamic>> _read(
     String scope,
     Map<String, dynamic> input,
@@ -702,6 +709,12 @@ class NativeRepository extends AppRepository {
       if (action == 'resolve' && access != null && !access!.canDownload) {
         input['force'] = true;
       }
+      // 番茄的内容来自本机引擎（安卓/iOS 是进程内 FFI，桌面端是独立进程）。
+      // 用户刚打开应用就点进来时引擎可能还在初始化，先等它一小会儿；
+      // 已经就绪或已确定失败时这里立即返回，不会拖慢正常请求。
+      if (_targetsFanqie(input)) {
+        await FanqieBackend.waitReady(const Duration(seconds: 8));
+      }
       final body = jsonEncode(input);
       final response =
           await Isolate.run(
@@ -718,8 +731,15 @@ class NativeRepository extends AppRepository {
             ),
           );
       if (response['ok'] != true) {
+        var message = response['error'] as String? ?? '读取失败，请重试';
+        if (message.contains('番茄内容引擎未就绪')) {
+          // 原生核心只知道「连不上引擎」，真正的现场在宿主这边（动态库没进包、
+          // 符号对不上、初始化失败、还在起……）。用宿主的原因替换掉那句通用
+          // 文案，用户看到的才是能照着做的信息。
+          message = '番茄内容引擎未就绪：${FanqieBackend.diagnosis}';
+        }
         throw AppFailure(
-          response['error'] as String? ?? '读取失败，请重试',
+          message,
           code: response['code'] as String? ?? '',
         );
       }

@@ -31,6 +31,15 @@ class FanqieBackend {
   static bool _started = false;
   static Process? _process;
 
+  /// 引擎是否已确认在监听 127.0.0.1:port（端口能连上才算数）。
+  static bool _ready = false;
+
+  /// 起不来的具体原因，供界面提示与「设置 → 日记」排查。
+  static String? _failure;
+
+  /// 运行目录：失败时从这里捞引擎自己写的日志尾巴。
+  static String? _runtimeDir;
+
   /// 桌面端可执行引擎的文件名。
   static String get _engineFileName =>
       Platform.isWindows ? 'fanqie_engine.exe' : 'fanqie_engine';
@@ -49,14 +58,77 @@ class FanqieBackend {
     _started = true;
     try {
       final runtimeDir = await _runtimeDirectory();
+      _runtimeDir = runtimeDir;
       if (Platform.isAndroid || Platform.isIOS) {
         await _startInProcess(runtimeDir, timeout);
       } else {
         await _startAsProcess(runtimeDir, timeout);
       }
     } catch (error) {
-      DiaryService.add('[fanqie] 内容引擎不可用: $error');
+      _fail('内容引擎不可用: $error');
     }
+  }
+
+  /// 给界面与错误文案用的引擎状态，一句话说清「为什么未就绪」。
+  ///
+  /// 安卓真机上「引擎未就绪」原来只有这一句，用户和开发者都无从下手；
+  /// 现在至少能区分：动态库没打进包 / 符号对不上 / 初始化失败 / 还在起 / 超时。
+  static String get diagnosis {
+    if (_ready) return '引擎已就绪';
+    final failure = _failure;
+    if (failure != null) return failure;
+    return _started ? '引擎仍在初始化' : '引擎未启动';
+  }
+
+  /// 等引擎就绪（或确定失败）。已就绪/已失败时立即返回。
+  ///
+  /// 首次进入番茄时引擎往往刚被拉起：安卓走进程内 FFI，要读配置、载设备池，
+  /// 慢的时候好几秒。先等一会儿再发请求，比直接弹「未就绪」体面得多。
+  static Future<bool> waitReady(Duration timeout) async {
+    if (_ready) return true;
+    if (!_started || _failure != null) return false;
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (_ready) return true;
+      if (_failure != null) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    return _ready;
+  }
+
+  static void _markReady() {
+    if (_ready) return;
+    _ready = true;
+    _failure = null;
+    DiaryService.add('[fanqie] 内容引擎就绪 (127.0.0.1:$port)');
+  }
+
+  /// 记录失败原因，并尽量带上引擎自己写的日志尾巴。
+  ///
+  /// 安卓上开发者拿不到 logcat（READ_LOGS 是系统权限），引擎的 panic / 初始化
+  /// 失败只会落在运行目录的 `fanqie_engine.log` 里；把它最后一行并进错误信息，
+  /// 用户截图或「设置 → 日记」就能直接看到现场。
+  static void _fail(String reason) {
+    var text = reason;
+    final dir = _runtimeDir;
+    if (dir != null) {
+      try {
+        final file = File(path.join(dir, 'fanqie_engine.log'));
+        if (file.existsSync()) {
+          final lines = file
+              .readAsStringSync()
+              .split('\n')
+              .map((line) => line.trim())
+              .where((line) => line.isNotEmpty)
+              .toList();
+          if (lines.isNotEmpty) text = '$reason；引擎日志：${lines.last}';
+        }
+      } catch (_) {
+        // 日志读不到不影响失败原因本身。
+      }
+    }
+    _failure = text;
+    DiaryService.add('[fanqie] $text');
   }
 
   /// 运行目录：引擎的 panic / 运行日志落在 `fanqie_engine.log`。
@@ -107,12 +179,12 @@ class FanqieBackend {
   static Future<void> _startAsProcess(String runtimeDir, Duration timeout) async {
     if (await _portOpen()) {
       DiaryService.add('[fanqie] 复用已在运行的引擎 (127.0.0.1:$port)');
+      _markReady();
       return;
     }
     final executable = await _locateEngine();
     if (executable == null) {
-      DiaryService.add('[fanqie] 未找到 $_engineFileName；'
-          '番茄源仍会显示，播放时会提示引擎未就绪');
+      _fail('未找到 $_engineFileName，本次安装包未带番茄引擎');
       return;
     }
     final process = await Process.start(executable, [
@@ -142,9 +214,9 @@ class FanqieBackend {
     }));
     final ready = await _waitForPort(timeout);
     if (ready) {
-      DiaryService.add('[fanqie] 内容引擎就绪 (127.0.0.1:$port)');
+      _markReady();
     } else {
-      DiaryService.add('[fanqie] 内容引擎启动超时，后台继续等待');
+      _fail('独立进程引擎启动超时（${timeout.inSeconds} 秒）');
     }
   }
 
@@ -196,19 +268,37 @@ class FanqieBackend {
   // Android / iOS：进程内 FFI
   // ---------------------------------------------------------------------------
 
-  static Future<void> _startInProcess(String runtimeDir, Duration timeout) async {
-    // Android 走随 APK 打包的 .so；iOS 的符号由静态库链进 Runner，
-    // 因此用 process() 在本进程里查。
-    final library = Platform.isAndroid
-        ? DynamicLibrary.open('libfanqie_shim.so')
-        : DynamicLibrary.process();
-    final init = library.lookupFunction<
-        Int32 Function(
-            Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Uint16),
-        int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>,
-            Pointer<Utf8>, int)>('fanqie_init');
-    final status =
-        library.lookupFunction<Int32 Function(), int Function()>('fanqie_status');
+  static Future<void> _startInProcess(String runtimeDir, Duration timeout) async {    // 每一步单独兜错：安卓真机上「未就绪」可能是没打进 .so、符号对不上、
+    // init 失败或者只是慢，笼统地报一句「不可用」等于什么都查不出来。
+    DynamicLibrary library;
+    DiaryService.add('[fanqie] 启动进程内引擎，宿主 ABI 推测 ${_processAbi()}');
+    try {
+      // Android 走随 APK 打包的 .so；iOS 的符号由静态库链进 Runner，
+      // 因此用 process() 在本进程里查。
+      library = Platform.isAndroid
+          ? DynamicLibrary.open('libfanqie_shim.so')
+          : DynamicLibrary.process();
+    } catch (error) {
+      _fail('无法加载引擎动态库 libfanqie_shim.so'
+          '（宿主 ABI 推测 ${_processAbi()}；仓库里只随包放了 arm64-v8a 一份，'
+          '若装的是 armeabi-v7a / x86_64 版 APK，请改用 arm64-v8a 那个包）：$error');
+      return;
+    }
+    late final int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>,
+        Pointer<Utf8>, int) init;
+    late final int Function() status;
+    try {
+      init = library.lookupFunction<
+          Int32 Function(
+              Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Uint16),
+          int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>,
+              Pointer<Utf8>, int)>('fanqie_init');
+      status = library
+          .lookupFunction<Int32 Function(), int Function()>('fanqie_status');
+    } catch (error) {
+      _fail('引擎动态库缺少 fanqie_init / fanqie_status 符号：$error');
+      return;
+    }
     // 统一用 calloc 分配、calloc 释放，避免 malloc/calloc 混用。
     final configPath =
         path.join(runtimeDir, 'config.json').toNativeUtf8(allocator: calloc);
@@ -224,22 +314,36 @@ class FanqieBackend {
       ..free(filterPath)
       ..free(runtimePath);
     if (result != 0) {
-      DiaryService.add('[fanqie] 引擎启动调用失败: $result');
+      _fail('引擎启动调用失败（fanqie_init 返回 $result）');
       return;
     }
     final deadline = DateTime.now().add(timeout);
     while (DateTime.now().isBefore(deadline)) {
-      final state = status();
-      if (state == 1) {
-        DiaryService.add('[fanqie] 内容引擎就绪 (127.0.0.1:$port)');
+      // 端口能连上才算真就绪：fanqie_status 只在 init 返回后才置位，
+      // 进程内启动慢的时候它会滞后于「服务已经在听」这个事实。
+      if (await _portOpen()) {
+        _markReady();
         return;
       }
-      if (state == -1) {
-        DiaryService.add('[fanqie] 内容引擎启动失败');
+      if (status() == -1) {
+        _fail('引擎初始化失败');
         return;
       }
       await Future<void>.delayed(const Duration(milliseconds: 250));
     }
-    DiaryService.add('[fanqie] 内容引擎等待就绪超时，后台继续启动');
+    _fail('引擎启动超时（${timeout.inSeconds} 秒）');
+  }
+
+  /// 从 Dart 的版本串里猜当前进程 ABI。
+  ///
+  /// 安卓上 `Platform.version` 会带 `android_arm64` / `android_arm` / `android_x64`
+  /// 这样的尾巴。只是给提示用的：真正能不能加载由 dlopen 说了算，这里猜错也
+  /// 不会改变任何逻辑。
+  static String _processAbi() {
+    final version = Platform.version.toLowerCase();
+    if (version.contains('arm64')) return 'arm64-v8a';
+    if (version.contains('x64') || version.contains('x86_64')) return 'x86_64';
+    if (version.contains('arm')) return 'armeabi-v7a';
+    return '未知';
   }
 }

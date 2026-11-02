@@ -55,6 +55,15 @@ ensure_printable_stdio()
 UPSTREAM_REPO = 'ch6vip/fqapp'
 UPSTREAM_COMMIT = 'aabde536c8621092f13b1a95f52e631b189f9243'
 
+# Android：ABI → (Rust target, NDK clang 包装脚本名模板)。
+# CI 用 --split-per-abi 出三个 APK，每个 ABI 的包里都得有自己的
+# libfanqie_shim.so，否则那个包上的番茄源一定「引擎未就绪」。
+ANDROID_TARGETS = {
+    'arm64-v8a': ('aarch64-linux-android', 'aarch64-linux-android{api}-clang'),
+    'armeabi-v7a': ('armv7-linux-androideabi', 'armv7a-linux-androideabi{api}-clang'),
+    'x86_64': ('x86_64-linux-android', 'x86_64-linux-android{api}-clang'),
+}
+
 root = Path(__file__).resolve().parents[1]
 shim_source = root / 'native' / 'fanqie_shim'
 
@@ -64,6 +73,14 @@ parser.add_argument('--target', action='append', default=[],
                     help='Rust target triple，可重复；默认按本机推断')
 parser.add_argument('--macos-universal', action='store_true',
                     help='macOS 同时编 arm64 与 x86_64 再 lipo 成通用二进制')
+parser.add_argument('--android', action='store_true',
+                    help='按 Android ABI 编 libfanqie_shim.so，输出到 <out>/<abi>/')
+parser.add_argument('--android-abi', action='append', default=[], choices=sorted(ANDROID_TARGETS),
+                    help='只编这些 Android ABI，默认三种全编')
+parser.add_argument('--android-skip-existing', action='store_true',
+                    help='目标位置已有 .so 时跳过（CI 用它保护仓库里已验证的产物）')
+parser.add_argument('--android-api', type=int, default=24,
+                    help='Android API level（与 app 的 minSdk 一致，默认 24）')
 parser.add_argument('--no-fetch', action='store_true',
                     help='跳过源码下载（本地已缓存时用）')
 options = parser.parse_args()
@@ -199,9 +216,95 @@ def artifact_names(triple):
     return 'fanqie_engine', 'libfanqie_shim.so', 'libfanqie_shim.a'
 
 
+def android_ndk():
+    """定位 Android NDK：先环境变量，再看 $ANDROID_HOME/ndk/<版本>（取最高版本）。"""
+    for name in ('ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT', 'ANDROID_NDK'):
+        value = os.environ.get(name)
+        if value and Path(value).is_dir():
+            return Path(value)
+    for name in ('ANDROID_HOME', 'ANDROID_SDK_ROOT'):
+        base = os.environ.get(name)
+        if not base:
+            continue
+        ndk_root = Path(base) / 'ndk'
+        if ndk_root.is_dir():
+            versions = sorted(item for item in ndk_root.iterdir() if item.is_dir())
+            if versions:
+                return versions[-1]
+    return None
+
+
+def android_toolchains(abis):
+    """返回 [(abi, rust target, clang 路径)]，顺手确认 NDK 里真有这些编译器。"""
+    ndk = android_ndk()
+    if ndk is None:
+        raise SystemExit(
+            '找不到 Android NDK：请设置 ANDROID_NDK_HOME，'
+            '或让 $ANDROID_HOME/ndk/<版本> 存在（CI 用 sdkmanager 安装 ndk）。'
+        )
+    host = {'darwin': 'darwin-x86_64', 'linux': 'linux-x86_64',
+            'win32': 'windows-x86_64'}.get(sys.platform)
+    if host is None:
+        raise SystemExit('不支持的宿主平台：' + sys.platform)
+    binaries = ndk / 'toolchains' / 'llvm' / 'prebuilt' / host / 'bin'
+    if not binaries.is_dir():
+        raise SystemExit('NDK 工具链目录不存在：' + str(binaries))
+    suffix = '.cmd' if sys.platform == 'win32' else ''
+    toolchains = []
+    for abi in abis:
+        triple, template = ANDROID_TARGETS[abi]
+        clang = binaries / (template.format(api=options.android_api) + suffix)
+        if not clang.is_file():
+            raise SystemExit('NDK 里找不到编译器：' + str(clang))
+        toolchains.append((abi, triple, clang))
+    return toolchains
+
+
+def build_android(toolchains):
+    """按 ABI 各编一份 libfanqie_shim.so，输出到 <out>/<abi>/。
+
+    APK 是按 ABI 拆分的，只有对应目录里有这份 .so，那个包上的番茄源才能起来；
+    默认 arm64 那份可以 `--android-skip-existing` 跳过，避免覆盖仓库里已经
+    在真机上跑过的产物。
+    """
+    crate = ensure_upstream()
+    cargo = cargo_binary()
+    environment = os.environ.copy()
+    environment.setdefault('CARGO_TERM_COLOR', 'always')
+    for abi, triple, clang in toolchains:
+        destination = out / abi / 'libfanqie_shim.so'
+        if options.android_skip_existing and destination.is_file():
+            print('已存在，保留原文件', destination, flush=True)
+            continue
+        target_env = environment.copy()
+        key = triple.upper().replace('-', '_')
+        target_env['CARGO_TARGET_%s_LINKER' % key] = str(clang)
+        # Android 15 起有 16KB 页的设备：段对齐按 16KB 来，否则装上去可能起不来。
+        target_env['CARGO_TARGET_%s_RUSTFLAGS' % key] = \
+            '-C link-arg=-Wl,-z,max-page-size=16384'
+        # cc / cc-rs 找编译器用的变量名有两种拼法，都给它。
+        ar = clang.parent / ('llvm-ar.exe' if sys.platform == 'win32' else 'llvm-ar')
+        for spelling in (triple, triple.replace('-', '_')):
+            target_env['CC_' + spelling] = str(clang)
+            if ar.is_file():
+                target_env['AR_' + spelling] = str(ar)
+        run([cargo, 'build', '--release', '--lib', '--target', triple,
+             '--manifest-path', crate / 'Cargo.toml'], env=target_env)
+        built = crate / 'target' / triple / 'release' / 'libfanqie_shim.so'
+        if not built.is_file():
+            raise SystemExit('构建产物缺失：' + str(built))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(built, destination)
+        print('输出', destination, flush=True)
+
+
 def main():
     if not shim_source.is_dir():
         raise SystemExit('缺少 native/fanqie_shim 源码目录。')
+    if options.android:
+        # 先验 NDK 再拉源码：缺工具链时不该先白下几十兆。
+        build_android(android_toolchains(options.android_abi or list(ANDROID_TARGETS)))
+        return
     crate = ensure_upstream()
     cargo = cargo_binary()
     targets = options.target or default_targets()

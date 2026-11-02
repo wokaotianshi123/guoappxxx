@@ -145,6 +145,9 @@ jobs:
   # 要编哪些平台由 prepare 算出来的矩阵决定：macOS 只在勾了 with_macos 时才有。
   engines:
     needs: prepare
+    # 引擎编不出来不该连坐：windows / web / macos 只是拿不到对应平台的引擎，
+    # 番茄源会降级提示，其余站源、其余产物照常。
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -294,6 +297,26 @@ jobs:
           }
           echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           echo "mode=release" >> "$GITHUB_OUTPUT"
+      # 番茄引擎：APK 是按 ABI 拆分的（--split-per-abi），每个包里都得有自己那份
+      # libfanqie_shim.so，否则那个包上一定提示「引擎未就绪」。仓库里只放了
+      # arm64-v8a 一份（真机验证过的），这里补编缺失的 ABI，已有的一律不覆盖。
+      - name: Cache Rust（安卓番茄引擎）
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/fanqie_engine
+          key: fanqie-android-${{ hashFiles('native/fanqie_shim/**', 'scripts/build_fanqie_engine.py') }}
+          restore-keys: |
+            fanqie-android-
+      - name: 编译安卓番茄引擎（补齐缺失 ABI）
+        continue-on-error: true
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          python scripts/build_fanqie_engine.py --android \
+            --out android/app/src/main/jniLibs --android-skip-existing
+          ls -l android/app/src/main/jniLibs/*/libfanqie_shim.so || true
       - run: python scripts/build_android.py ${{ matrix.arguments }}
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
