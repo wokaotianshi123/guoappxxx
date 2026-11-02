@@ -83,6 +83,9 @@ def start_script(slug):
         '  *) BIN="./' + slug + '-linux" ;;',
         'esac',
         'chmod +x "$BIN"',
+        # 番茄引擎是同目录的另一个可执行文件，由服务进程拉起。部分解压器会丢掉
+        # zip 里的可执行位，这里顺手补上，否则番茄源会一直提示「引擎未就绪」。
+        'chmod +x ./fanqie_engine-* 2>/dev/null',
         'if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x "./ffmpeg" ]; then',
         '  echo ""',
         '  echo "没有检测到 ffmpeg。"',
