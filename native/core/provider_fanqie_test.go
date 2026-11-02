@@ -1,7 +1,12 @@
 package core
 
 import (
+	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -159,4 +164,101 @@ type errFanqieChineseStub struct{}
 
 func (errFanqieChineseStub) Error() string {
 	return "upstream connect failed: 由于目标计算机积极拒绝，无法连接。 (os error 10061)"
+}
+
+// fanqieDirectText 是「统一传输在 loopback 上不可用」时的兜底通道：
+// 它必须是干净直连，并且能正常把引擎的 JSON 读回来。
+func TestFanqieDirectTextReadsEngineResponse(t *testing.T) {
+	var gotReferer string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotReferer = r.Header.Get("Referer")
+		if r.URL.Path != "/api/v1/search" {
+			t.Errorf("请求路径 = %q, 期望 /api/v1/search", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"code":0,"data":{"tabs":{}}}`)
+	}))
+	defer server.Close()
+
+	body, err := fanqieDirectText(context.Background(), server.URL+"/api/v1/search", "http://127.0.0.1:18921/")
+	if err != nil {
+		t.Fatalf("直连取数失败: %v", err)
+	}
+	if !strings.Contains(body, `"code":0`) {
+		t.Fatalf("响应体 = %q", body)
+	}
+	if gotReferer != "http://127.0.0.1:18921/" {
+		t.Fatalf("Referer = %q", gotReferer)
+	}
+}
+
+// 非 2xx 要变成一句能贴进提示的错误，不能把响应体当 JSON 继续往下走。
+func TestFanqieDirectTextReportsStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "capability required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	_, err := fanqieDirectText(context.Background(), server.URL+"/api/v1/videos/1", "")
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("错误 = %v, 期望带状态码 401", err)
+	}
+}
+
+// 兜底客户端绝不能走代理：手机上的系统代理 / TUN 正是会把 loopback 请求转走的那一层。
+func TestFanqieLocalClientBypassesProxy(t *testing.T) {
+	transport, ok := fanqieLocalClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("兜底客户端传输类型 = %T", fanqieLocalClient.Transport)
+	}
+	// Proxy 为 nil 就是「完全不查代理」，这正是我们想要的；非 nil 时也不能给出代理。
+	request := &http.Request{URL: &url.URL{Scheme: "http", Host: "127.0.0.1:18921"}}
+	if transport.Proxy != nil {
+		proxy, err := transport.Proxy(request)
+		if proxy != nil || err != nil {
+			t.Fatalf("兜底客户端解析出代理 %v / %v, 期望直连", proxy, err)
+		}
+	}
+	if !transport.DisableKeepAlives {
+		t.Fatal("兜底客户端不应复用连接：引擎重启后旧连接会让请求直接 EOF")
+	}
+}
+
+// 统一传输在 loopback 上报错时（Android 真机出现过的组合：Dart 直连 /health 200，
+// Go 走统一传输却报连接层错误），必须能用干净直连把请求救回来，并记住优先直连。
+func TestFanqieFetchTextFallsBackToDirect(t *testing.T) {
+	fanqieDirectPreferred.Store(false)
+	t.Cleanup(func() { fanqieDirectPreferred.Store(false) })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"code":0}`)
+	}))
+	t.Cleanup(server.Close)
+
+	d := &Downloader{
+		cfg:           Config{dataDir: t.TempDir(), Retries: 1, PageSize: 30, MaxPagesPerSort: 1, FanqieURL: server.URL},
+		client:        &http.Client{Transport: fanqieBrokenTransport{}},
+		limiter:       newRequestLimiter(3, 0),
+		providerHosts: map[string]string{},
+	}
+	text, err := d.fanqieFetchText(context.Background(), server.URL+"/api/v1/search?query=x", server.URL+"/")
+	if err != nil {
+		t.Fatalf("兜底直连没救回来: %v", err)
+	}
+	if !strings.Contains(text, `"code":0`) {
+		t.Fatalf("响应体 = %q", text)
+	}
+	if !fanqieDirectPreferred.Load() {
+		t.Fatal("直连成功后应记住「优先直连」，否则每次都要先白等一轮失败")
+	}
+	// 记住之后，即使统一传输依旧坏着，也能直接拿到结果。
+	if _, err := d.fanqieFetchText(context.Background(), server.URL+"/api/v1/search?query=y", ""); err != nil {
+		t.Fatalf("优先直连失败: %v", err)
+	}
+}
+
+// fanqieBrokenTransport 模拟「连接被拒/被劫持」的统一传输。
+type fanqieBrokenTransport struct{}
+
+func (fanqieBrokenTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("dial tcp 127.0.0.1:18921: connect: connection refused")
 }

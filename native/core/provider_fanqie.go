@@ -22,10 +22,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 const fanqieDefaultBaseURL = "http://127.0.0.1:18921"
@@ -112,9 +117,83 @@ func (d *Downloader) fanqieFeedState(tabType int) *fanqieFeedState {
 	return state
 }
 
+// fanqieLocalClient 是只跟本机引擎对话的最小 HTTP 客户端。
+//
+// 为什么不复用 d.client：那条链路为外网站源叠了浏览器指纹传输、CDN 择优、系统代理
+// 和长连接池。Android 真机实测过一种情况——同一个 APP 进程里 Dart 直接 GET /health
+// 拿到 200，而 Go 侧走统一传输的请求却报连接层错误——说明问题在传输栈，不在引擎。
+// loopback 请求只需要一条干净的直连：不代理、不指纹、不复用连接。
+var fanqieLocalClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:             nil,
+		DialContext:       (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: -1}).DialContext,
+		DisableKeepAlives: true,
+	},
+	// 比 providerTimeout 宽松：详情/取流要等引擎向上游签发，冷启动时更慢。
+	Timeout: 30 * time.Second,
+}
+
+// fanqieDirectPreferred 记住「统一传输在 loopback 上不可靠」这个事实：一旦直连
+// 救过一次，后续请求就直接走直连，不再先白等一轮退避重试。
+var fanqieDirectPreferred atomic.Bool
+
+// fanqieFetchText 取一个本机引擎路由的响应体：先走应用统一传输（保留限速与诊断），
+// 失败后用一个干净的直连客户端重试一次。两次都失败则把两条错误一起抛出来——
+// 「未就绪」这种提示只有带上两侧的原始错误，才能在真机上分清是引擎没起、
+// 传输栈被劫持，还是引擎 handler 自己挂了。
+func (d *Downloader) fanqieFetchText(ctx context.Context, rawURL, referer string) (string, error) {
+	if fanqieDirectPreferred.Load() {
+		if text, err := fanqieDirectText(ctx, rawURL, referer); err == nil {
+			return text, nil
+		}
+		// 直连这条路也可能断（引擎重启），退回去再试一次，别把用户卡死。
+		return d.fetchProviderText(ctx, rawURL, referer)
+	}
+	text, err := d.fetchProviderText(ctx, rawURL, referer)
+	if err == nil {
+		return text, nil
+	}
+	direct, directErr := fanqieDirectText(ctx, rawURL, referer)
+	if directErr == nil {
+		fanqieDirectPreferred.Store(true)
+		return direct, nil
+	}
+	return "", fmt.Errorf("%v；直连重试：%v", err, directErr)
+}
+
+// fanqieDirectText 用 fanqieLocalClient 打一次本机引擎路由。
+func fanqieDirectText(ctx context.Context, rawURL, referer string) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("User-Agent", userAgent)
+	if referer != "" {
+		request.Header.Set("Referer", referer)
+	}
+	request.Header.Set("Accept", "application/json")
+	response, err := fanqieLocalClient.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
+	if err != nil {
+		return "", err
+	}
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		snippet := strings.TrimSpace(string(body))
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		return "", fmt.Errorf("引擎返回 HTTP %d：%s", response.StatusCode, snippet)
+	}
+	return string(body), nil
+}
+
 // fanqieGetJSON GET 一个本机引擎路由并解出顶层 JSON。
 func (d *Downloader) fanqieGetJSON(ctx context.Context, rawURL string) (map[string]any, error) {
-	text, err := d.fetchProviderText(ctx, rawURL, d.fanqieBase()+"/")
+	text, err := d.fanqieFetchText(ctx, rawURL, d.fanqieBase()+"/")
 	if err != nil {
 		return nil, fanqieOfflineHint(err)
 	}

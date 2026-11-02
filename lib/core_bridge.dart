@@ -736,10 +736,11 @@ class NativeRepository extends AppRepository {
           // 原生核心只知道「连不上引擎」，真正的现场在宿主这边（动态库没进包、
           // 符号对不上、初始化失败、还在起……）。用宿主的原因替换掉那句通用
           // 文案，用户看到的才是能照着做的信息。
-          // 带上 action：同样的「未就绪」可能发生在目录、搜索、详情或取流，
-          // 少一个字段就得靠猜。
+          // 带上 action 和 Go 侧原文：同样的「未就绪」可能发生在目录、搜索、
+          // 详情或取流，只有原文里的 URL 与 errno 能分清是哪一层挂的。
+          final original = message;
           final reason = await FanqieBackend.describeNow();
-          message = '番茄内容引擎未就绪（$action）：$reason';
+          message = '番茄内容引擎未就绪（$action）：$reason；调用失败原文：$original';
         }
         throw AppFailure(
           message,

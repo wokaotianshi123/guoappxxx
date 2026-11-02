@@ -108,9 +108,9 @@ class FanqieBackend {
       return _failure ?? '引擎没有在 127.0.0.1:$port 监听（已退出或还没起来）';
     }
     final health = await _healthLine();
-    // /health 不是 2xx 或直接失败时，把引擎日志最后一行也贴出来——Rust 里的
-    // panic 只写在这个文件里（安卓没有 logcat 权限）。
-    final tail = health.startsWith('/health 2') ? null : _logTail();
+    // 不管 /health 是否 200 都带上日志尾巴：/health 只能证明引擎的 HTTP 层活着，
+    // 某个 handler 里的 panic 它照样返回 ok。安卓上没有 logcat，这个文件是唯一现场。
+    final tail = _logTail();
     final detail = tail == null ? health : '$health；引擎日志：$tail';
     final failure = _failure;
     if (failure != null) return '$failure；端口在听，$detail';
@@ -162,7 +162,10 @@ class FanqieBackend {
           .map((line) => line.trim())
           .where((line) => line.isNotEmpty)
           .toList();
-      return lines.isEmpty ? null : lines.last;
+      if (lines.isEmpty) return null;
+      // 引擎的一行日志可能很长（带堆栈），贴进提示前截断。
+      final last = lines.last;
+      return last.length > 160 ? '${last.substring(0, 160)}…' : last;
     } catch (_) {
       // 日志读不到不影响失败原因本身。
       return null;
