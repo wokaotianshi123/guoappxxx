@@ -40,10 +40,16 @@ func nativePlaybackChoices(media providerMedia, quality int) nativePlaybackChoic
 		}
 	}
 	sort.SliceStable(choice.media, func(i, j int) bool { return choice.media[i].Quality > choice.media[j].Quality })
-	for value := range qualities {
-		choice.qualities = append(choice.qualities, value)
+	if len(media.QualityOptions) > 0 {
+		// 站源直接给出档位（如番茄：每档单独缓存）——照抄，不要靠线路去反推，
+		// 否则会为了列档位而伪造出并不存在的「线路」。
+		choice.qualities = append(choice.qualities, media.QualityOptions...)
+	} else {
+		for value := range qualities {
+			choice.qualities = append(choice.qualities, value)
+		}
+		sort.Sort(sort.Reverse(sort.IntSlice(choice.qualities)))
 	}
-	sort.Sort(sort.Reverse(sort.IntSlice(choice.qualities)))
 	if quality > 0 && qualities[quality] {
 		filtered := make([]providerMedia, 0, len(choice.media))
 		for _, option := range choice.media {

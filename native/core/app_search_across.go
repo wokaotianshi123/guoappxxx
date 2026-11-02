@@ -32,7 +32,7 @@ var errSearchUnsupported = errors.New("站源暂不支持在线搜索")
 func nativeSourceSupportsSearch(source string) bool {
 	switch source {
 	case sourceHongguo, sourceHuangju, sourceGuipian, sourceHanxiaoquan,
-		sourceYeguo, sourceDSD, sourceSorani, sourceA123, sourceIkanbot:
+		sourceYeguo, sourceDSD, sourceSorani, sourceA123, sourceIkanbot, sourceFanqie:
 		return true
 	}
 	if isDuanjuProviderSource(source) {
@@ -143,6 +143,17 @@ func (engine *nativeEngine) nativeSearchSource(ctx context.Context, source, quer
 		}
 		return result, nil
 
+	case source == sourceFanqie:
+		items, more, err := d.fetchFanqieSearchPage(ctx, page, query)
+		if err != nil {
+			return result, err
+		}
+		for _, drama := range items {
+			result.Items = append(result.Items, nativeNormalize(drama))
+		}
+		result.HasMore = more
+		return result, nil
+
 	case source == sourceA123 || source == sourceIkanbot:
 		var items []Drama
 		var more bool
@@ -168,6 +179,9 @@ func (engine *nativeEngine) nativeSearchSource(ctx context.Context, source, quer
 func duanjuSourceLabel(source string) string {
 	if isDuanjuProviderSource(source) {
 		return duanjuSourceName(source)
+	}
+	if canonicalProviderSource(source) == sourceFanqie {
+		return "番茄"
 	}
 	return source
 }

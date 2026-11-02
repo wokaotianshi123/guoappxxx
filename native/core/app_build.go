@@ -11,6 +11,11 @@ func nativeSourceAvailable(source string) bool {
 	if source == sourceHongguo {
 		return true
 	}
+	// 番茄是内置站源：目录/详情/取流由本机番茄内容引擎承担，与 buildAllSources
+	// 无关，两种构建（全剧视界 / 短剧视界）下都应常驻可用。
+	if source == sourceFanqie {
+		return true
+	}
 	if isCustomMaccmsSource(source) {
 		return isHuangguoProviderSource(source)
 	}

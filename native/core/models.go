@@ -107,4 +107,7 @@ type Task struct {
 	OutPath         string  `json:"outPath"`
 	ReleaseStatus   string  `json:"releaseStatus,omitempty"`
 	DownloadQuality int     `json:"downloadQuality,omitempty"`
+	// Quality 是「取流时就要选定档位」的站源（如番茄：每档单独缓存）需要的档位，
+	// 0 表示自动（由站源决定默认档）。
+	Quality int `json:"quality,omitempty"`
 }

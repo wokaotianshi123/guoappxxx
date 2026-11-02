@@ -16,8 +16,14 @@ void main() {
     SharedPreferences.setMockInitialValues({'source': 'huangdou'});
     final store = testStore(await SharedPreferences.getInstance());
     expect(appSlug, allSourcesEnabled ? 'quanjushijie' : 'duanjushijie');
-    // 默认只开启红果、韩小圈、鬼片网与青空次元，其余站源需在站源管理中开启。
-    expect(store.sources.length, allSourcesEnabled ? 4 : 1);
+    // 默认开启 = 当前版本可见源里所有「非受限」源；番茄与红果是常驻内置源，
+    // 两种构建都必须在列（番茄的内容引擎在 Android 内置，其余平台见 README）。
+    final defaultOn = SourceSite.values
+        .where((source) => !SourceSite.isRestricted(source.id))
+        .length;
+    expect(store.sources.length, defaultOn);
+    expect(store.sources.map((source) => source.id), contains('fanqie'));
+    expect(store.sources.map((source) => source.id), contains('hongguo'));
     expect(
       SourceSite.values.any((source) => source.id == 'dsd'),
       allSourcesEnabled,
@@ -29,7 +35,7 @@ void main() {
     expect(store.source, 'hongguo');
     if (allSourcesEnabled) {
       await store.setSourceEnabled('dsd', true);
-      expect(store.sources.length, 5);
+      expect(store.sources.length, defaultOn + 1);
       expect(store.allowsSource('dsd'), isTrue);
     } else {
       await expectLater(store.setSourceEnabled('dsd', true), throwsStateError);

@@ -6,7 +6,13 @@ dist/
 coverage/
 
 native/build/
-android/app/src/main/jniLibs/
+# jniLibs 整体是构建产物目录，但番茄内容引擎的 Rust 产物没有源码可重建
+# （依赖的 fqapp/rust 未随仓库提供），必须随仓库携带，否则换台机器打出的
+# APK 会缺 libfanqie_shim.so，番茄源直接不可用。
+android/app/src/main/jniLibs/*
+!android/app/src/main/jniLibs/arm64-v8a/
+android/app/src/main/jniLibs/arm64-v8a/*
+!android/app/src/main/jniLibs/arm64-v8a/libfanqie_shim.so
 windows/runner/duanju_core.dll
 windows/runner/duanju_core.h
 ios/DuanjuCore/*.xcframework/

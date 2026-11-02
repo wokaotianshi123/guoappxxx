@@ -60,6 +60,7 @@ var sourceNames = []struct {
 	Name string
 }{
 	{"hongguo", "红果"},
+	{"fanqie", "番茄"},
 	{"ikanbot", "爱看机器人"},
 	{"a123", "A123"},
 	{"hanxiaoquan", "韩小圈"},

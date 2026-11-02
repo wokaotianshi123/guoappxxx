@@ -78,6 +78,9 @@ func validNativeCategory(source, category string) bool {
 		return validIkanbotCategory(category)
 	case sourceA123:
 		return validA123Category(category)
+	case sourceFanqie:
+		_, ok := fanqieCategoryTabTypes[category]
+		return ok
 	}
 	if isDuanjuProviderSource(source) {
 		return validDuanjuCategory(source, category)
@@ -98,6 +101,11 @@ func (engine *nativeEngine) nativeCategories(ctx context.Context, source string,
 		return append(all, nativeAICategories...), nil
 	case sourceHuangdou:
 		return all, nil
+	case sourceFanqie:
+		return append(all,
+			nativeCategory{ID: fanqieCategoryKanju, Name: "看剧"},
+			nativeCategory{ID: fanqieCategoryManju, Name: "漫剧"},
+		), nil
 	}
 	if isCustomMaccmsSource(source) {
 		// 自定义 maccms 站点：从首页导航实时提取分类；识别不到则仅展示"全部"。

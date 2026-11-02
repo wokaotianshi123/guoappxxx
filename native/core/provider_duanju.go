@@ -193,7 +193,9 @@ func validDuanjuCategory(source, category string) bool {
 	case sourceHeguo, sourceXingguo, sourceYaguo, sourceMaoguo, sourceNiuguo:
 		return webProviderNumericID.MatchString(strings.SplitN(category, "-", 2)[0])
 	case sourceFanguo, sourceGuanguo:
-		return true
+		// 这两个源同时接受中文分类名（都市）与纯数字分类 ID（462）；
+		// 但分类会拼进抓取地址，含路径分隔符的一律拒绝，避免构造出跨目录请求。
+		return !strings.ContainsAny(category, "/\\")
 	default:
 		return true
 	}

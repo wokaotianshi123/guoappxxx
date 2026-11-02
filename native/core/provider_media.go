@@ -19,6 +19,9 @@ type providerMedia struct {
 	CENCKey     []byte
 	Quality     int
 	Variants    []providerMedia
+	// QualityOptions 是站源直接给出的可选清晰度档位（如 1080/720/540/480/360）。
+	// 番茄这类「按档位分别缓存」的源走这个字段，避免为了列档位而伪造多条线路。
+	QualityOptions []int
 }
 
 func (d *Downloader) providerBaseURL(source string) string {
@@ -49,6 +52,8 @@ func (d *Downloader) providerBaseURL(source string) string {
 		fallback = ikanbotSiteBaseURL
 	case sourceA123:
 		fallback = a123SiteBaseURL
+	case sourceFanqie:
+		configured, fallback = d.cfg.FanqieURL, fanqieDefaultBaseURL
 	default:
 		fallback = "https://d2pypzndaqisk.cloudfront.net"
 	}
@@ -158,6 +163,10 @@ func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (provi
 	}
 	if chapter.Source == sourceA123 {
 		return d.resolveA123Media(ctx, task)
+	}
+	// 番茄按档位分别缓存，取流时就要把档位带给引擎。
+	if chapter.Source == sourceFanqie {
+		return d.resolveFanqieMedia(ctx, chapter, task.Quality)
 	}
 	if isDuanjuProviderSource(chapter.Source) {
 		return d.resolveDuanjuMedia(ctx, task)

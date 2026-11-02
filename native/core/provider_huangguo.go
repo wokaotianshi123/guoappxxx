@@ -33,6 +33,9 @@ const (
 	sourceHanxiaoquan   = "hanxiaoquan"
 	sourceIkanbot       = "ikanbot"
 	sourceA123          = "a123"
+	// sourceFanqie 是番茄站源：目录/详情/取流由本机番茄内容引擎
+	// （libfanqie_shim，127.0.0.1:18921）承担，见 provider_fanqie.go。
+	sourceFanqie = "fanqie"
 
 	providerMaxBodyBytes = 20 * 1024 * 1024
 	providerTimeout      = 12 * time.Second
@@ -105,7 +108,7 @@ func splitProviderDramaID(id string) (source, sourceID string, ok bool) {
 
 func isHuangguoProviderSource(source string) bool {
 	switch canonicalProviderSource(source) {
-	case sourceHuangguoAI, sourceHuangguoVideo, sourceHuangdou, sourceHongguo, sourceHuangju, sourceYeguo, sourceDSD, sourceCloudFront, sourceSorani, sourceGuipian, sourceHanxiaoquan, sourceIkanbot, sourceA123:
+	case sourceHuangguoAI, sourceHuangguoVideo, sourceHuangdou, sourceHongguo, sourceHuangju, sourceYeguo, sourceDSD, sourceCloudFront, sourceSorani, sourceGuipian, sourceHanxiaoquan, sourceIkanbot, sourceA123, sourceFanqie:
 		return true
 	}
 	return isDuanjuProviderSource(source)
@@ -140,6 +143,8 @@ func canonicalProviderSource(source string) string {
 		return sourceIkanbot
 	case "a123", "a123tv", "a123tv.com", "www.a123tv.com":
 		return sourceA123
+	case "fanqie", "fanqie.tv", "fqnovel.com", "番茄":
+		return sourceFanqie
 	default:
 		if canonical, found := duanjuSourceAliases[key]; found {
 			return canonical
@@ -268,6 +273,9 @@ func (d *Downloader) GetHuangguoChapters(ctx context.Context, source, sourceID s
 		return drama.DisplayTitle(), chapters, err
 	case sourceA123:
 		drama, chapters, err := d.fetchA123Detail(ctx, sourceID)
+		return drama.DisplayTitle(), chapters, err
+	case sourceFanqie:
+		drama, chapters, err := d.fetchFanqieDetail(ctx, sourceID)
 		return drama.DisplayTitle(), chapters, err
 	default:
 		if isDuanjuProviderSource(source) {

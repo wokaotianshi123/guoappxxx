@@ -37,6 +37,8 @@ type Config struct {
 	HanxiaoquanURL   string
 	IkanbotURL       string
 	A123URL          string
+	// FanqieURL 是番茄内容引擎（本机 loopback REST）地址，留空用默认 127.0.0.1:18921。
+	FanqieURL        string
 	Token            string
 	AESKeyHex        string
 	InterfaceKey     string
@@ -76,6 +78,9 @@ type Downloader struct {
 	previewMu             sync.Mutex
 	previewSessions       map[string]*huangguoPreviewSession
 	browserTransport      *huangguoBrowserTransport
+	// 番茄站源的翻页游标（按 tab_type 分频道保留 cell/session/offset）。
+	fanqieMu    sync.Mutex
+	fanqieFeeds map[int]*fanqieFeedState
 }
 
 func defaultConfig() Config { return Config{MaxPagesPerSort: 50, PageSize: 30, Retries: 2} }
@@ -699,6 +704,8 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		items, result.HasMore, err = d.fetchIkanbotCatalogPage(ctx, page, category, "")
 	case sourceA123:
 		items, result.HasMore, err = d.fetchA123CatalogPage(ctx, page, category, "")
+	case sourceFanqie:
+		items, result.HasMore, err = d.fetchFanqieCatalogPage(ctx, category, page)
 	default:
 		if isDuanjuProviderSource(source) {
 			items, result.HasMore, err = d.fetchDuanjuCatalogPage(ctx, source, page, category)
@@ -707,7 +714,7 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 	if err != nil && len(items) == 0 {
 		return result, err
 	}
-	if len(items) == 0 && page == 1 && source != sourceHuangju && source != sourceYeguo && source != sourceDSD && source != sourceSorani && source != sourceGuipian && source != sourceHanxiaoquan && source != sourceIkanbot && source != sourceA123 && !isDuanjuProviderSource(source) {
+	if len(items) == 0 && page == 1 && source != sourceHuangju && source != sourceYeguo && source != sourceDSD && source != sourceSorani && source != sourceGuipian && source != sourceHanxiaoquan && source != sourceIkanbot && source != sourceA123 && source != sourceFanqie && !isDuanjuProviderSource(source) {
 		return result, errors.New("站源暂未返回剧集，请稍后刷新")
 	}
 	if err != nil {
@@ -753,6 +760,8 @@ func (engine *nativeEngine) nativeDetail(ctx context.Context, drama nativeDrama)
 		raw, chapters, err = engine.downloader.fetchGuipianDetail(ctx, sourceID)
 	case sourceHanxiaoquan:
 		raw, chapters, err = engine.downloader.fetchHanxiaoquanDetail(ctx, sourceID)
+	case sourceFanqie:
+		raw, chapters, err = engine.downloader.fetchFanqieDetail(ctx, sourceID)
 	default:
 		title, chapters, err = engine.downloader.GetHuangguoChapters(ctx, source, sourceID)
 	}
@@ -802,7 +811,7 @@ func (engine *nativeEngine) nativeResolve(ctx context.Context, input nativeInput
 			}
 		}
 	}
-	task := Task{DramaID: input.Drama.ID, DramaTitle: input.Drama.Title, Chapter: input.Chapter, Index: input.Index}
+	task := Task{DramaID: input.Drama.ID, DramaTitle: input.Drama.Title, Chapter: input.Chapter, Index: input.Index, Quality: input.Quality}
 	media, err := engine.downloader.resolveProviderMedia(ctx, task)
 	if err != nil {
 		return nativePlan{}, err

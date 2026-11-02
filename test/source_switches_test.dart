@@ -22,12 +22,14 @@ void main() {
 
   test('restricted sources start switched off', () async {
     final store = await create();
-    expect(
-      store.sources.map((site) => site.id),
-      allSourcesEnabled
-          ? ['hongguo', 'hanxiaoquan', 'guipian', 'sorani']
-          : ['hongguo'],
-    );
+    // 默认开启 = 当前版本可见源里所有「非受限」源；番茄与红果是常驻内置源，
+    // 两种构建都必须出现，其余受限源默认关闭。
+    final expected = SourceSite.values
+        .where((site) => !SourceSite.isRestricted(site.id))
+        .map((site) => site.id)
+        .toList();
+    expect(store.sources.map((site) => site.id), expected);
+    expect(expected, containsAll(<String>['fanqie', 'hongguo']));
     expect(store.permittedSources.length, SourceSite.values.length);
     expect(store.sourceEnabled('hongguo'), isTrue);
     expect(store.sourceEnabled('huangdou'), isFalse);
