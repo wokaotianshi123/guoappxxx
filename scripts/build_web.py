@@ -28,7 +28,7 @@ def edition_name(slug):
     return '全剧视界' if is_all_sources(slug) else '短剧视界'
 
 environment = os.environ.copy()
-environment.setdefault('GOPROXY', 'https://goproxy.cn,direct')
+environment.setdefault('GOPROXY', 'https://goproxy.cn,https://proxy.golang.org,direct')
 environment.setdefault('GOSUMDB', 'off')
 environment['CGO_ENABLED'] = '0'
 go = shutil.which('go')

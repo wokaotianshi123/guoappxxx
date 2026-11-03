@@ -16,7 +16,10 @@ options = parser.parse_args()
 variant = BuildVariant(options.all_sources)
 
 environment = os.environ.copy()
-environment.setdefault('GOPROXY', 'https://goproxy.cn,direct')
+# CI 的默认值是 proxy.golang.org（偶发流中断）；setdefault 不覆盖已设值，
+# 手动设了 GOPROXY 时以手动值为准。多代理轮换：前一个下载失败就切下一个。
+if 'GOPROXY' not in os.environ:
+    environment['GOPROXY'] = 'https://goproxy.cn,https://proxy.golang.org,direct'
 environment.setdefault('GOSUMDB', 'off')
 environment['CGO_ENABLED'] = '1'
 go = shutil.which('go')
@@ -37,9 +40,25 @@ def build(goos, architecture, compiler, output, extra=None):
     if extra:
         build_env.update(extra)
     print('Building ' + str(output.relative_to(root)), flush=True)
-    subprocess.run([go, 'build', '-trimpath', '-buildmode=c-shared',
-                    '-ldflags=' + variant.linker_flags, '-o', str(output), './bridge'],
-                   cwd=root / 'native', env=build_env, check=True)
+    args = [go, 'build', '-trimpath', '-buildmode=c-shared',
+            '-ldflags=' + variant.linker_flags, '-o', str(output), './bridge']
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            subprocess.run(args, cwd=root / 'native', env=build_env, check=True)
+            return
+        except subprocess.CalledProcessError as error:
+            # 只处理编译失败；其它错误（如 NDK 缺失）直接抛出。
+            if error.returncode != 1 or attempt >= 5:
+                raise
+            # 先补齐依赖再重试：Go 模块代理（proxy.golang.org）偶发 HTTP/2
+            # 流中断（stream error: INTERNAL_ERROR），go build 本身没有自动重试。
+            if subprocess.run([go, 'mod', 'download'], cwd=root / 'native',
+                              env=build_env, check=False).returncode:
+                print('依赖下载失败，重试…（第 ' + str(attempt) + ' 次）', flush=True)
+                continue
+            print('编译失败，重试…（第 ' + str(attempt) + ' 次）', flush=True)
 
 if options.platform == 'android':
     sdk = os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT')

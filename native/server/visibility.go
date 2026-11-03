@@ -17,11 +17,20 @@ import (
 // 自定义源记录、已缓存内容与播放都不受影响。
 const visibilityFile = "source-visibility.json"
 
+// sourceVisibilityRevision 标记源显示列表的结构版本。
+// 新增内置源时递增，并在 loadVisibility 里把该版本新增的隐藏源补进旧存档，
+// 保证升级后的老用户也默认看不到新站源，同时不覆盖用户之后手动开启的选择。
+const sourceVisibilityRevision = 2
+
+// revisionHiddenSources 是 revision 2 新增、默认隐藏的内置源。
+var revisionHiddenSources = []string{"xchina", "theporny"}
+
 // 从未保存过源显示列表时的默认隐藏集，与 App 端
 // SourceSite.defaultHiddenSiteIds 保持一致：
 // 默认可见 = 红果、韩小圈、鬼片、A123、爱看机器人，其余内置源默认隐藏。
 var defaultHiddenSources = map[string]bool{
 	"huangdou": true, "huangju": true, "yeguo": true, "dsd": true,
+	"xchina": true, "theporny": true,
 	"huangguo-video": true, "huangguoai": true, "cloudfront": true,
 	"yaguo": true, "maoguo": true, "fanguo": true, "guanguo": true,
 	"heguo": true, "xingguo": true, "huaguo": true, "niuguo": true,
@@ -50,7 +59,8 @@ func loadVisibility() {
 	if visibilityPath != "" {
 		if raw, err := os.ReadFile(visibilityPath); err == nil {
 			var parsed struct {
-				Hidden []string `json:"hidden"`
+				Hidden   []string `json:"hidden"`
+				Revision int      `json:"revision"`
 			}
 			if json.Unmarshal(raw, &parsed) == nil {
 				hiddenSources = map[string]bool{}
@@ -60,6 +70,12 @@ func loadVisibility() {
 					}
 				}
 				visibilityLoaded = true
+				if parsed.Revision < sourceVisibilityRevision {
+					for _, id := range revisionHiddenSources {
+						hiddenSources[id] = true
+					}
+					_ = saveVisibility()
+				}
 				return
 			}
 		}
@@ -80,7 +96,7 @@ func saveVisibility() error {
 	for id := range hiddenSources {
 		ids = append(ids, id)
 	}
-	raw, err := json.MarshalIndent(map[string]any{"hidden": ids}, "", "  ")
+	raw, err := json.MarshalIndent(map[string]any{"hidden": ids, "revision": sourceVisibilityRevision}, "", "  ")
 	if err != nil {
 		return err
 	}

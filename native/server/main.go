@@ -69,6 +69,8 @@ var sourceNames = []struct {
 	{"huangju", "剧果"},
 	{"yeguo", "野果"},
 	{"dsd", "帝果"},
+	{"xchina", "XChina"},
+	{"theporny", "Theporny"},
 	{"huangguo-video", "黄果视频"},
 	{"huangguoai", "黄果 AI"},
 	{"cloudfront", "黄果旧版"},

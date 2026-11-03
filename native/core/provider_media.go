@@ -54,6 +54,10 @@ func (d *Downloader) providerBaseURL(source string) string {
 		fallback = a123SiteBaseURL
 	case sourceFanqie:
 		configured, fallback = d.cfg.FanqieURL, fanqieDefaultBaseURL
+	case sourceXChina:
+		configured, fallback = d.cfg.XChinaURL, xchinaBaseURL
+	case sourceTheporny:
+		configured, fallback = d.cfg.ThepornyURL, thepornyHosts[0]
 	default:
 		fallback = "https://d2pypzndaqisk.cloudfront.net"
 	}
@@ -94,6 +98,10 @@ func providerSourceForURL(raw string) string {
 		return sourceIkanbot
 	case host == "a123tv.com" || host == "www.a123tv.com":
 		return sourceA123
+	case host == "xchina.tube" || host == "www.xchina.tube":
+		return sourceXChina
+	case host == "theporny.com" || host == "www.theporny.com":
+		return sourceTheporny
 	default:
 		return ""
 	}
@@ -167,6 +175,12 @@ func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (provi
 	// 番茄按档位分别缓存，取流时就要把档位带给引擎。
 	if chapter.Source == sourceFanqie {
 		return d.resolveFanqieMedia(ctx, chapter, task.Quality)
+	}
+	if chapter.Source == sourceXChina {
+		return d.resolveXChinaMedia(ctx, task)
+	}
+	if chapter.Source == sourceTheporny {
+		return d.resolveThepornyMedia(ctx, task)
 	}
 	if isDuanjuProviderSource(chapter.Source) {
 		return d.resolveDuanjuMedia(ctx, task)

@@ -299,7 +299,7 @@ def main():
     if platform.system() != 'Darwin':
         raise SystemExit('macOS 构建需要 macOS 与 Xcode Command Line Tools。')
     environment = os.environ.copy()
-    environment.setdefault('GOPROXY', 'https://goproxy.cn,direct')
+    environment.setdefault('GOPROXY', 'https://goproxy.cn,https://proxy.golang.org,direct')
     environment.setdefault('GOSUMDB', 'off')
     flutter = shutil.which('flutter')
     if not flutter:

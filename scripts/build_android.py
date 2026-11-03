@@ -18,7 +18,7 @@ env = os.environ.copy()
 if platform.system() == 'Darwin':
     env['LANG'] = 'en_US.UTF-8'
     env['LC_ALL'] = 'en_US.UTF-8'
-env.setdefault('GOPROXY', 'https://goproxy.cn,direct')
+env.setdefault('GOPROXY', 'https://goproxy.cn,https://proxy.golang.org,direct')
 env.setdefault('GOSUMDB', 'off')
 flutter = shutil.which('flutter')
 if not flutter:

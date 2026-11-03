@@ -38,14 +38,16 @@ type Config struct {
 	IkanbotURL       string
 	A123URL          string
 	// FanqieURL 是番茄内容引擎（本机 loopback REST）地址，留空用默认 127.0.0.1:18921。
-	FanqieURL        string
-	Token            string
-	AESKeyHex        string
-	InterfaceKey     string
-	ParamKey         string
-	ParamIV          string
-	APIBase          string
-	CDNURL           string
+	FanqieURL    string
+	XChinaURL    string
+	ThepornyURL  string
+	Token        string
+	AESKeyHex    string
+	InterfaceKey string
+	ParamKey     string
+	ParamIV      string
+	APIBase      string
+	CDNURL       string
 }
 
 type Downloader struct {
@@ -79,8 +81,12 @@ type Downloader struct {
 	previewSessions       map[string]*huangguoPreviewSession
 	browserTransport      *huangguoBrowserTransport
 	// 番茄站源的翻页游标（按 tab_type 分频道保留 cell/session/offset）。
-	fanqieMu    sync.Mutex
-	fanqieFeeds map[int]*fanqieFeedState
+	fanqieMu     sync.Mutex
+	fanqieFeeds  map[int]*fanqieFeedState
+	xchinaOnce   sync.Once
+	xchinaCore   *xchinaClient
+	thepornyOnce sync.Once
+	thepornyCore *thepornyClient
 }
 
 func defaultConfig() Config { return Config{MaxPagesPerSort: 50, PageSize: 30, Retries: 2} }
@@ -102,7 +108,7 @@ type nativeDrama struct {
 	Tags           []string `json:"tags,omitempty"`
 	ReleaseStatus  string   `json:"releaseStatus,omitempty"`
 	// Peers 在跨源聚合搜索里带上其它站源的同一部剧，供界面一键切换播放源。
-	Peers          []nativeDrama `json:"peers,omitempty"`
+	Peers []nativeDrama `json:"peers,omitempty"`
 }
 
 type nativeInput struct {
@@ -154,22 +160,22 @@ type nativeCatalogResult struct {
 }
 
 type nativePlan struct {
-	ExpiresAt       int64             `json:"expiresAt,omitempty"`
-	PrefetchedBytes int64             `json:"prefetchedBytes,omitempty"`
-	DanmakuID       string            `json:"danmakuId,omitempty"`
-	Local           bool              `json:"local"`
-	URL             string            `json:"url"`
+	ExpiresAt       int64  `json:"expiresAt,omitempty"`
+	PrefetchedBytes int64  `json:"prefetchedBytes,omitempty"`
+	DanmakuID       string `json:"danmakuId,omitempty"`
+	Local           bool   `json:"local"`
+	URL             string `json:"url"`
 	// DirectURL 是站源返回的原始播放地址（未经本机中转）。投屏时优先用它，
 	// 让电视自己去拉流，手机退出 App 也不影响播放。只有不需要本机重写播放
 	// 列表、也不需要本机解密分片时才非空；本地文件与加密线路为空。
-	DirectURL       string            `json:"directUrl,omitempty"`
-	Headers         map[string]string `json:"headers"`
-	Key             string            `json:"decryptionKey,omitempty"`
-	Quality         int               `json:"quality"`
-	Qualities       []int             `json:"qualities"`
-	Session         string            `json:"session,omitempty"`
-	RouteIndex      int               `json:"routeIndex"`
-	RouteCount      int               `json:"routeCount"`
+	DirectURL  string            `json:"directUrl,omitempty"`
+	Headers    map[string]string `json:"headers"`
+	Key        string            `json:"decryptionKey,omitempty"`
+	Quality    int               `json:"quality"`
+	Qualities  []int             `json:"qualities"`
+	Session    string            `json:"session,omitempty"`
+	RouteIndex int               `json:"routeIndex"`
+	RouteCount int               `json:"routeCount"`
 }
 
 type nativeEngine struct {
@@ -706,6 +712,10 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		items, result.HasMore, err = d.fetchA123CatalogPage(ctx, page, category, "")
 	case sourceFanqie:
 		items, result.HasMore, err = d.fetchFanqieCatalogPage(ctx, category, page)
+	case sourceXChina:
+		items, result.HasMore, err = d.fetchXChinaCatalogPage(ctx, page, category, "")
+	case sourceTheporny:
+		items, result.HasMore, err = d.fetchThepornyCatalogPage(ctx, page, category, "")
 	default:
 		if isDuanjuProviderSource(source) {
 			items, result.HasMore, err = d.fetchDuanjuCatalogPage(ctx, source, page, category)
@@ -714,7 +724,7 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 	if err != nil && len(items) == 0 {
 		return result, err
 	}
-	if len(items) == 0 && page == 1 && source != sourceHuangju && source != sourceYeguo && source != sourceDSD && source != sourceSorani && source != sourceGuipian && source != sourceHanxiaoquan && source != sourceIkanbot && source != sourceA123 && source != sourceFanqie && !isDuanjuProviderSource(source) {
+	if len(items) == 0 && page == 1 && source != sourceHuangju && source != sourceYeguo && source != sourceDSD && source != sourceSorani && source != sourceGuipian && source != sourceHanxiaoquan && source != sourceIkanbot && source != sourceA123 && source != sourceFanqie && source != sourceXChina && source != sourceTheporny && !isDuanjuProviderSource(source) {
 		return result, errors.New("站源暂未返回剧集，请稍后刷新")
 	}
 	if err != nil {
@@ -762,6 +772,10 @@ func (engine *nativeEngine) nativeDetail(ctx context.Context, drama nativeDrama)
 		raw, chapters, err = engine.downloader.fetchHanxiaoquanDetail(ctx, sourceID)
 	case sourceFanqie:
 		raw, chapters, err = engine.downloader.fetchFanqieDetail(ctx, sourceID)
+	case sourceXChina:
+		raw, chapters, err = engine.downloader.fetchXChinaDetail(ctx, sourceID)
+	case sourceTheporny:
+		raw, chapters, err = engine.downloader.fetchThepornyDetail(ctx, sourceID)
 	default:
 		title, chapters, err = engine.downloader.GetHuangguoChapters(ctx, source, sourceID)
 	}

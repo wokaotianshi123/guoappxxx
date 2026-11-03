@@ -31,6 +31,8 @@ class SourceSite {
       id == 'hanxiaoquan' ||
       id == 'ikanbot' ||
       id == 'a123' ||
+      id == 'xchina' ||
+      id == 'theporny' ||
       duanjuPaged;
   bool get duanjuPaged => const {
     'yaguo',
@@ -102,6 +104,8 @@ class SourceSite {
     SourceSite('huangju', '剧果', '热门 · 最新 · 分类短剧'),
     SourceSite('yeguo', '野果', '分类短剧 · 在线搜索'),
     dsd,
+    SourceSite('xchina', 'XChina', '分类视频 · 在线搜索'),
+    SourceSite('theporny', 'Theporny', '分类视频 · 在线搜索'),
     SourceSite('huangguo-video', '黄果视频', '视频剧集'),
     SourceSite('huangguoai', '黄果 AI', 'AI 短剧'),
     SourceSite('cloudfront', '黄果旧版', '旧 API 剧库'),

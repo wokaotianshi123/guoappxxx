@@ -13,7 +13,7 @@ add_variant_argument(parser)
 options = parser.parse_args()
 variant = BuildVariant(options.all_sources)
 env = os.environ.copy()
-env.setdefault('GOPROXY', 'https://goproxy.cn,direct')
+env.setdefault('GOPROXY', 'https://goproxy.cn,https://proxy.golang.org,direct')
 env.setdefault('GOSUMDB', 'off')
 flutter = shutil.which('flutter')
 if not flutter:
