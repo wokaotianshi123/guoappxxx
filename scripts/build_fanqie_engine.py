@@ -137,6 +137,58 @@ def download(url, destination):
     raise SystemExit('上游源码下载失败：%s' % last_error)
 
 
+def patch_upstream_tls(upstream):
+    """让上游的「流式下载客户端」复用 webpki-roots，而不是平台验证器。
+
+    上游 ``endpoints/video.rs`` 里另起了一个裸 ``reqwest::Client::builder()``。
+    reqwest 0.13 默认的证书验证走 ``rustls-platform-verifier``，而安卓是进程内
+    核心（``fanqie_init``），从来没初始化过它——首次构建这个客户端就会 panic，
+    现场表现是「引擎端口在听、/health 200，但取视频一律 context deadline
+    exceeded，重试 EOF」，引擎日志只剩一句
+    ``Expect rustls-platform-verifier to be initialized``。
+
+    上游主链路 ``upstream/http.rs`` 已经自己用 webpki-roots 建好 TLS 配置并通过
+    ``tls_backend_preconfigured`` 注入，这里让流式客户端也照做即可。补丁对桌面端
+    同样有效（webpki 根证书各平台通用），并且是幂等的。
+    """
+    http_rs = upstream / 'rust' / 'src' / 'upstream' / 'http.rs'
+    video_rs = upstream / 'rust' / 'src' / 'endpoints' / 'video.rs'
+    for path in (http_rs, video_rs):
+        if not path.is_file():
+            raise SystemExit('上游源码结构异常，缺少：' + str(path))
+
+    text = http_rs.read_text(encoding='utf-8')
+    if 'pub(crate) fn build_tls_config' not in text:
+        if 'fn build_tls_config()' not in text:
+            raise SystemExit('上游 http.rs 里找不到 build_tls_config，补丁需人工核对')
+        text = text.replace('fn build_tls_config()', 'pub(crate) fn build_tls_config()', 1)
+        http_rs.write_text(text, encoding='utf-8')
+
+    text = video_rs.read_text(encoding='utf-8')
+    if 'tls_backend_preconfigured' in text:
+        return  # 已打过补丁
+    old = (
+        '            reqwest::Client::builder()\n'
+        '                .timeout(VIDEO_DOWNLOAD_TIMEOUT)\n'
+        '                .build()\n'
+        '                .ok()'
+    )
+    new = (
+        '            // 安卓进程内核心没有初始化 rustls-platform-verifier，\n'
+        '            // 裸 client 会在 build 时 panic；复用主链路的 webpki 配置。\n'
+        '            let tls = crate::upstream::http::build_tls_config().ok()?;\n'
+        '            reqwest::Client::builder()\n'
+        '                .tls_backend_preconfigured(tls)\n'
+        '                .timeout(VIDEO_DOWNLOAD_TIMEOUT)\n'
+        '                .build()\n'
+        '                .ok()'
+    )
+    if old not in text:
+        raise SystemExit('上游 video.rs 的 streaming_client 结构与补丁不匹配，需人工核对')
+    video_rs.write_text(text.replace(old, new, 1), encoding='utf-8')
+    print('已为上游打上 webpki TLS 补丁（流式下载客户端）', flush=True)
+
+
 def ensure_upstream():
     """把上游源码放到 build/fanqie_engine/native/fqapp，并同步 shim crate。"""
     work = root / 'build' / 'fanqie_engine'
@@ -176,6 +228,7 @@ def ensure_upstream():
     if target_crate.exists():
         shutil.rmtree(target_crate)
     shutil.copytree(shim_source, target_crate)
+    patch_upstream_tls(upstream)
     return target_crate
 
 

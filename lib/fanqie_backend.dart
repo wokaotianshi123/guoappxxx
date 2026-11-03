@@ -51,11 +51,33 @@ class FanqieBackend {
   /// 界面上仍然是「引擎未就绪」而不是静默失败。
   static bool get supported => true;
 
+  /// 正在进行的启动尝试。并发调用复用同一个 Future，避免重复拉进程。
+  static Future<void>? _starting;
+
   /// 启动引擎并等待就绪。超时不抛错。
   static Future<void> ensureStarted({
     Duration timeout = const Duration(seconds: 25),
   }) async {
-    if (_started || !supported) return;
+    if (!supported) return;
+    if (_ready) return;
+    final running = _starting;
+    if (running != null) {
+      await running;
+      return;
+    }
+    // 以前 `_started` 一置 true 就永久放弃重试：引擎被杀、端口被瞬时占住
+    // 过一次，这个会话就再也起不来，界面只能一直提示「未就绪」。
+    // 现在每次调用都允许重试，靠 `_starting` 保证同一时刻只有一次尝试。
+    final attempt = _start(timeout);
+    _starting = attempt;
+    try {
+      await attempt;
+    } finally {
+      _starting = null;
+    }
+  }
+
+  static Future<void> _start(Duration timeout) async {
     _started = true;
     try {
       final runtimeDir = await _runtimeDirectory();
@@ -81,17 +103,18 @@ class FanqieBackend {
     return _started ? '引擎仍在初始化' : '引擎未启动';
   }
 
-  /// 等引擎就绪（或确定失败）。已就绪/已失败时立即返回。
+  /// 等引擎就绪：没起来就先补一次启动，再按 [timeout] 轮询端口。
   ///
   /// 首次进入番茄时引擎往往刚被拉起：安卓走进程内 FFI，要读配置、载设备池，
   /// 慢的时候好几秒。先等一会儿再发请求，比直接弹「未就绪」体面得多。
   static Future<bool> waitReady(Duration timeout) async {
     if (_ready) return true;
-    if (!_started || _failure != null) return false;
+    // 引擎没起来、或者半路退出过，这里补一次启动再等：以前初始化那一次
+    // 失败就再没有第二次机会，用户只能重启应用。
+    unawaited(ensureStarted());
     final deadline = DateTime.now().add(timeout);
     while (DateTime.now().isBefore(deadline)) {
       if (_ready) return true;
-      if (_failure != null) return false;
       await Future<void>.delayed(const Duration(milliseconds: 200));
     }
     return _ready;
@@ -163,8 +186,12 @@ class FanqieBackend {
           .where((line) => line.isNotEmpty)
           .toList();
       if (lines.isEmpty) return null;
-      // 引擎的一行日志可能很长（带堆栈），贴进提示前截断。
-      final last = lines.last;
+      // Rust 的 panic 是两行：真正的原因在第一行，最后一行往往只是
+      // 「note: run with RUST_BACKTRACE=1」。优先挑 panic 那一行。
+      final last = lines.lastWhere(
+        (line) => line.contains('panicked at') || line.contains('panicked'),
+        orElse: () => lines.last,
+      );
       return last.length > 160 ? '${last.substring(0, 160)}…' : last;
     } catch (_) {
       // 日志读不到不影响失败原因本身。
@@ -230,6 +257,15 @@ class FanqieBackend {
       _markReady();
       return;
     }
+    // 上一次拉起的进程还活着（只是端口还没开）：重试时别再拉第二个。
+    if (_process != null) {
+      if (await _waitForPort(timeout)) {
+        _markReady();
+      } else {
+        _fail('独立进程引擎启动超时（${timeout.inSeconds} 秒）');
+      }
+      return;
+    }
     final executable = await _locateEngine();
     if (executable == null) {
       _fail('未找到 $_engineFileName，本次安装包未带番茄引擎');
@@ -257,6 +293,10 @@ class FanqieBackend {
     unawaited(process.exitCode.then((code) {
       if (_process == process) _process = null;
       if (!_stopping) {
+        // 引擎半路退出必须算进「未就绪」：以前只写一条日记，界面上仍然
+        // 显示「引擎已就绪」，用户点播放只会看到超时，查不出是引擎死了。
+        _ready = false;
+        _failure = '内容引擎进程已退出（code=$code）';
         DiaryService.add('[fanqie] 内容引擎退出，code=$code');
       }
     }));
@@ -270,12 +310,42 @@ class FanqieBackend {
 
   static bool _stopping = false;
 
+  /// 引擎日志文件的体积上限：超过就只留后半段，避免长时间运行吃满磁盘。
+  static const int _engineLogLimit = 256 * 1024;
+
   static void _logEngineOutput(String line, String kind) {
     final text = line.trim();
     if (text.isEmpty) return;
     // 引擎的普通日志量不小，只把错误与就绪行写进诊断日志。
     if (kind == 'err' || text.contains('ready')) {
       DiaryService.add('[fanqie:$kind] $text');
+      // 桌面端也要落盘：引擎在 handler 里 panic 时，进程直接没了，
+      // 界面上的「引擎日志」尾巴只能从这份文件里取（安卓的进程内引擎
+      // 自己会写同名文件，桌面端原来没人写，提示里永远缺现场）。
+      _appendEngineLog(text);
+    }
+  }
+
+  /// 把引擎输出追加到运行目录的 `fanqie_engine.log`。
+  ///
+  /// 只写诊断相关的行（错误、就绪），并且写成同步的——进程随时可能被
+  /// panic 带走，异步落盘有概率丢最后几行，而那几行正是最有用的。
+  static void _appendEngineLog(String text) {
+    final dir = _runtimeDir;
+    if (dir == null) return;
+    try {
+      final file = File(path.join(dir, 'fanqie_engine.log'));
+      if (file.existsSync() && file.lengthSync() > _engineLogLimit) {
+        final content = file.readAsStringSync();
+        final half = _engineLogLimit ~/ 2;
+        final tail = content.length > half
+            ? content.substring(content.length - half)
+            : content;
+        file.writeAsStringSync(tail, flush: true);
+      }
+      file.writeAsStringSync('$text\n', mode: FileMode.append, flush: true);
+    } catch (_) {
+      // 日志写不进去不能影响引擎本身。
     }
   }
 
