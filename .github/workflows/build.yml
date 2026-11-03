@@ -383,6 +383,36 @@ jobs:
           if (-not $exe) { throw 'MinGW-w64 安装失败，找不到 gcc' }
           Split-Path $exe | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & $exe --version | Select-Object -First 1
+      # media_kit 的 Windows 原生库（libmpv / ANGLE）都在外网仓库上，runner 偶发
+      # 403/429 或连接重置时，CMake 里一次 file(DOWNLOAD) 就会把整个 configure 打断，
+      # 表现为「Unable to generate build files」。这里先用 curl 带重试拉一遍，
+      # 成功后交给 CMake 当本地缓存（它仍会校验 sha256）；预下载失败也不致命，
+      # CMake 会退回自己重试的网络路径。
+      - name: Prefetch media_kit native archives
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'build\media-cache'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $items = @(
+            @{ Name = 'mpv-dev-x86_64-20260920-git-e76a35ec95.7z'; Url = 'https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/mpv-dev-x86_64-20260920-git-e76a35ec95.7z' },
+            @{ Name = 'ANGLE-v1.0.1.7z'; Url = 'https://github.com/alexmercerind/flutter-windows-ANGLE-OpenGL-ES/releases/download/v1.0.1/ANGLE.7z' }
+          )
+          foreach ($item in $items) {
+            $out = Join-Path $dir $item.Name
+            if (Test-Path $out) { Remove-Item $out -Force }
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              curl.exe -L --fail --silent --show-error --retry 4 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o $out $item.Url
+              if ($LASTEXITCODE -eq 0 -and (Test-Path $out) -and (Get-Item $out).Length -gt 0) { break }
+              Write-Host "下载 $($item.Name) 失败（第 $attempt 次），稍后重试"
+              if (Test-Path $out) { Remove-Item $out -Force }
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+            if (-not (Test-Path $out)) { Write-Host "::warning::$($item.Name) 预下载失败，交给 CMake 自行重试" }
+          }
+          foreach ($line in @(
+            "DUANJU_MPV_ARCHIVE=$dir\mpv-dev-x86_64-20260920-git-e76a35ec95.7z",
+            "DUANJU_ANGLE_ARCHIVE=$dir\ANGLE-v1.0.1.7z"
+          )) { [System.IO.File]::AppendAllText($env:GITHUB_ENV, "$line`n") }
       - run: python scripts/build_windows.py ${{ matrix.arguments }}
       - uses: actions/upload-artifact@v4
         with:

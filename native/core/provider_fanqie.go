@@ -69,38 +69,53 @@ func (d *Downloader) fanqieBase() string {
 	return strings.TrimRight(firstNonEmpty(d.cfg.FanqieURL, fanqieDefaultBaseURL), "/")
 }
 
-// fanqieOfflineHint 把「连不上本机引擎」翻译成可操作的提示。
-// 桌面端 / 本地服务器端没有内嵌引擎，直接连 127.0.0.1:18921 会得到连接失败，
-// 原始错误对用户没有任何指引意义。
-//
+// fanqieOfflineMarkers 是「连不上本机引擎」在各传输栈上的报错特征。
 // 关键字按「可能的报错文案」覆盖三层，避免换个平台/换个传输实现就漏判：
 //   - Go 标准库：connect: connection refused / dial tcp ... / no such host / EOF
 //   - tls-client（Rust 后端）：upstream connect failed: ... (os error 10061)
 //   - Windows 本地化文案：由于目标计算机积极拒绝，无法连接。
-func fanqieOfflineHint(err error) error {
+//
+// 重试判定与用户提示必须共用这一份：分头维护迟早会出现「该重试的没重试」
+// 或者「把引擎的业务错误当断线重试」。
+var fanqieOfflineMarkers = []string{
+	"connection refused",
+	"connect:",
+	"connectex",
+	"dial tcp",
+	"upstream connect failed",
+	"os error 10061",
+	"eof",
+	"no such host",
+	"无法连接",
+	"积极拒绝",
+}
+
+// fanqieLooksOffline 判断错误是不是「引擎这一侧压根没接上」。
+// 引擎正常回了业务错误（比如 401/500）时返回 false——那种重试没有意义。
+func fanqieLooksOffline(err error) bool {
 	if err == nil {
-		return nil
+		return false
 	}
 	lower := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"connection refused",
-		"connect:",
-		"connectex",
-		"dial tcp",
-		"upstream connect failed",
-		"os error 10061",
-		"eof",
-		"no such host",
-		"无法连接",
-		"积极拒绝",
-	} {
+	for _, marker := range fanqieOfflineMarkers {
 		if strings.Contains(lower, marker) {
-			// 把原始错误一起带上：光说「未就绪」在真机上没法判断到底是引擎没起来、
-			// 端口被占、还是请求被服务端拒了。URL 出口会做脱敏，这里用无 scheme 的地址。
-			return fmt.Errorf("番茄内容引擎未就绪（本机 %s）：%v", fanqieEngineAddress, err)
+			return true
 		}
 	}
-	return err
+	return false
+}
+
+// fanqieOfflineHint 把「连不上本机引擎」翻译成可操作的提示。
+// 桌面端 / 本地服务器端没有内嵌引擎，直接连 127.0.0.1:18921 会得到连接失败，
+// 原始错误对用户没有任何指引意义。
+func fanqieOfflineHint(err error) error {
+	if !fanqieLooksOffline(err) {
+		return err
+	}
+	// 把原始错误一起带上：光说「未就绪」在真机上没法判断到底是引擎没起来、
+	// 端口被占、还是请求被服务端拒了。URL 出口会做脱敏，这里用无 scheme 的地址。
+	return fmt.Errorf("番茄内容引擎未就绪（本机 %s，已等待 %s 仍连不上）：%v",
+		fanqieEngineAddress, fanqieEngineWarmupWindow, err)
 }
 
 func (d *Downloader) fanqieFeedState(tabType int) *fanqieFeedState {
@@ -137,11 +152,48 @@ var fanqieLocalClient = &http.Client{
 // 救过一次，后续请求就直接走直连，不再先白等一轮退避重试。
 var fanqieDirectPreferred atomic.Bool
 
-// fanqieFetchText 取一个本机引擎路由的响应体：先走应用统一传输（保留限速与诊断），
+// fanqieEngineWarmupWindow 是「引擎正在起」的等待上限。
+//
+// 桌面版和本地服务版都是由宿主先把引擎拉成独立进程，再从 loopback 发请求；
+// 从进程创建到 /health 能应答之间有一段空窗（读过设备池、载入缓存后更久）。
+// 以前这个窗口里的第一个请求直接拿到 connection refused，被翻译成
+// 「引擎未就绪」——用户随后手动 curl 却是 200，于是最典型的反馈就是
+// 「引擎明明活着，应用却说未就绪」。
+//
+// 这里在放弃之前先等这个窗口：引擎确实没装/被杀了，最多多等这么久；
+// 引擎只是在起，则第一个请求就能正常返回。
+const fanqieEngineWarmupWindow = 12 * time.Second
+
+// fanqieFetchText 取一个本机引擎路由的响应体。
+//
+// 冷启动窗口内「连不上」会退避重试（200ms 起、指数增长，总时长受
+// fanqieEngineWarmupWindow 约束）；引擎回了业务错误则立即上抛。
+func (d *Downloader) fanqieFetchText(ctx context.Context, rawURL, referer string) (string, error) {
+	deadline := time.Now().Add(fanqieEngineWarmupWindow)
+	delay := 200 * time.Millisecond
+	for {
+		text, err := d.fanqieFetchTextOnce(ctx, rawURL, referer)
+		if err == nil {
+			return text, nil
+		}
+		// 只有「根本没接上」才值得等：业务错误重试只会把问题放大。
+		if !fanqieLooksOffline(err) || ctx.Err() != nil || time.Now().Add(delay).After(deadline) {
+			return "", err
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return "", err
+		}
+		delay *= 2
+	}
+}
+
+// fanqieFetchTextOnce 是单次尝试：先走应用统一传输（保留限速与诊断），
 // 失败后用一个干净的直连客户端重试一次。两次都失败则把两条错误一起抛出来——
 // 「未就绪」这种提示只有带上两侧的原始错误，才能在真机上分清是引擎没起、
 // 传输栈被劫持，还是引擎 handler 自己挂了。
-func (d *Downloader) fanqieFetchText(ctx context.Context, rawURL, referer string) (string, error) {
+func (d *Downloader) fanqieFetchTextOnce(ctx context.Context, rawURL, referer string) (string, error) {
 	if fanqieDirectPreferred.Load() {
 		if text, err := fanqieDirectText(ctx, rawURL, referer); err == nil {
 			return text, nil

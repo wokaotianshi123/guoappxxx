@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFanqieDramaFromCardMapsCoreFields(t *testing.T) {
@@ -261,4 +262,80 @@ type fanqieBrokenTransport struct{}
 
 func (fanqieBrokenTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, errors.New("dial tcp 127.0.0.1:18921: connect: connection refused")
+}
+
+type fanqieStubTransport func(*http.Request) (*http.Response, error)
+
+func (stub fanqieStubTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return stub(request)
+}
+
+// 引擎是宿主异步拉起的：进程刚创建时 18921 还没人听，第一个请求会拿到
+// connection refused。以前的实现立刻把它翻译成「引擎未就绪」，于是出现
+// 「手动 curl /health 明明是 200，应用却说引擎没起来」这种自相矛盾的反馈。
+// 这里守住新行为：连不上先退避等一等，引擎接上就正常返回。
+func TestFanqieFetchTextWaitsForColdEngine(t *testing.T) {
+	fanqieDirectPreferred.Store(false)
+	t.Cleanup(func() { fanqieDirectPreferred.Store(false) })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"code":0}`)
+	}))
+	t.Cleanup(server.Close)
+
+	original := fanqieLocalClient
+	t.Cleanup(func() { fanqieLocalClient = original })
+
+	var direct int
+	fanqieLocalClient = &http.Client{Transport: fanqieStubTransport(func(request *http.Request) (*http.Response, error) {
+		direct++
+		if direct == 1 {
+			return nil, errors.New("dial tcp 127.0.0.1:18921: connect: connection refused")
+		}
+		return http.DefaultTransport.RoundTrip(request)
+	})}
+
+	d := &Downloader{
+		cfg:           Config{dataDir: t.TempDir(), Retries: 1, PageSize: 30, MaxPagesPerSort: 1, FanqieURL: server.URL},
+		client:        &http.Client{Transport: fanqieBrokenTransport{}},
+		limiter:       newRequestLimiter(3, 0),
+		providerHosts: map[string]string{},
+	}
+
+	started := time.Now()
+	text, err := d.fanqieFetchText(context.Background(), server.URL+"/api/v1/search", "")
+	if err != nil {
+		t.Fatalf("冷启动期间的重试没救回来: %v", err)
+	}
+	if !strings.Contains(text, `"code":0`) {
+		t.Fatalf("响应体 = %q", text)
+	}
+	if direct < 2 {
+		t.Fatalf("引擎连不上时应当重试，实际直连只调用了 %d 次", direct)
+	}
+	if elapsed := time.Since(started); elapsed < 150*time.Millisecond {
+		t.Fatalf("重试之间应当有退避，实际只用了 %s", elapsed)
+	}
+}
+
+// 引擎已经在正常回业务错误时，不能被当成断线反复重试。
+func TestFanqieLooksOfflineIgnoresBusinessErrors(t *testing.T) {
+	for _, err := range []error{
+		errors.New("番茄引擎错误 500: upstream busy"),
+		errors.New("番茄引擎返回格式无效: unexpected end of JSON input"),
+		nil,
+	} {
+		if fanqieLooksOffline(err) {
+			t.Fatalf("%v 不该被判定成引擎没接上", err)
+		}
+	}
+	for _, err := range []error{
+		errors.New("dial tcp 127.0.0.1:18921: connect: connection refused"),
+		errors.New("upstream connect failed: 由于目标计算机积极拒绝，无法连接。 (os error 10061)"),
+		errors.New("Get \"http://127.0.0.1:18921/health\": EOF"),
+	} {
+		if !fanqieLooksOffline(err) {
+			t.Fatalf("%v 应当被判定成引擎没接上", err)
+		}
+	}
 }
