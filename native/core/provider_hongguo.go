@@ -206,7 +206,8 @@ func (d *Downloader) resolveHongguoMedia(ctx context.Context, task Task) (provid
 	if !hongguoNumericID.MatchString(videoID) || !hongguoNumericID.MatchString(seriesID) {
 		return providerMedia{}, fmt.Errorf("红果章节 ID 无效，请重新获取章节")
 	}
-	media, nativeErr := d.resolveHongguoAppMedia(ctx, videoID)
+	// 1.0.4 取流走 multi_video_model + V5 签名（X-Helios/X-Medusa），含主/辅助设备轮转。
+	media, nativeErr := d.appMediaV5(ctx, videoID)
 	if nativeErr == nil {
 		return media, nil
 	}
