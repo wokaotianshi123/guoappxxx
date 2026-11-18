@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -627,6 +628,10 @@ func v5PlaybackPayload(videoID string) []byte {
 
 // resolveHongguoV5Media 用 V5 签名调 multi_video_model 取流（1.0.4 取流路径）。
 // helper 为 true 时走辅助设备（主设备取不到兼容媒体时轮转用）。
+//
+// 对齐 1.0.4 模块 appRequest 的重试策略：请求失败或返回空 body 时重试，
+// 空 body 时用被拒绝的设备号触发换设备（最多 hongguoDeviceRotations 次）。
+// 红果在设备失效时返回 HTTP 200 + 空 body，旧实现单次请求即放弃，导致放不出来。
 func (d *Downloader) resolveHongguoV5Media(ctx context.Context, videoID string, helper bool) (providerMedia, error) {
 	if !hongguoNumericID.MatchString(videoID) {
 		return providerMedia{}, errors.New("红果视频 ID 无效")
@@ -639,68 +644,132 @@ func (d *Downloader) resolveHongguoV5Media(ctx context.Context, videoID string, 
 	deviceID, installID, _ := client.deviceLocked(helper)
 	client.mu.Unlock()
 
-	cdid := uuidLike()
-	now := time.Now()
-	nowMs := now.UnixMilli()
+	// body 在重试间保持不变（X-SS-STUB 依赖其 MD5），与 JS 一致。
 	body := v5PlaybackPayload(videoID)
+	attempts := d.cfg.Retries
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > 3 {
+		attempts = 3
+	}
+	rotations := 0
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return providerMedia{}, err
+		}
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return providerMedia{}, ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
 
-	signedURL, headers, err := signV5Playback(hongguoPlaybackBaseURL+hongguoPlaybackPath, v5PlaybackQuery(deviceID, installID, cdid), body, nowMs, v5Random)
-	if err != nil {
-		return providerMedia{}, err
+		signedURL, headers, err := signV5Playback(hongguoPlaybackBaseURL+hongguoPlaybackPath, v5PlaybackQuery(deviceID, installID, uuidLike()), body, time.Now().UnixMilli(), v5Random)
+		if err != nil {
+			return providerMedia{}, err
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, signedURL, strings.NewReader(string(body)))
+		if err != nil {
+			return providerMedia{}, err
+		}
+		request.Header.Set("User-Agent", hongguoPlaybackUserAgent)
+		request.Header.Set("Accept", "application/json")
+		for key, value := range headers {
+			request.Header.Set(key, value)
+		}
+		response, err := d.doPreparedCatalogRequest(request, 20*time.Second, nil)
+		if err != nil {
+			lastErr = err
+			var backoff *requestBackoff
+			if errors.As(err, &backoff) || ctx.Err() != nil {
+				return providerMedia{}, err
+			}
+			continue
+		}
+		content, readErr := io.ReadAll(io.LimitReader(response.Body, providerMaxBodyBytes+1))
+		response.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if response.StatusCode != http.StatusOK {
+			lastErr = errors.New("红果 App 取流接口 HTTP " + strconv.Itoa(response.StatusCode))
+			if response.StatusCode >= 400 && response.StatusCode < 500 {
+				return providerMedia{}, lastErr
+			}
+			continue
+		}
+		if len(content) == 0 || len(content) > providerMaxBodyBytes {
+			lastErr = errors.New("红果 App 取流接口未返回有效数据")
+			// 空 body 通常是设备号失效：用被拒绝的设备号触发重新注册并换号重试。
+			if rotations < hongguoDeviceRotations && d.ensureHongguoDevice(ctx, helper, deviceID) == nil {
+				rotations++
+				client.mu.Lock()
+				deviceID, installID, _ = client.deviceLocked(helper)
+				client.mu.Unlock()
+				attempt--
+			}
+			continue
+		}
+		var result map[string]any
+		decoder := json.NewDecoder(bytes.NewReader(content))
+		decoder.UseNumber()
+		if err := decoder.Decode(&result); err != nil || result == nil {
+			return providerMedia{}, errors.New("红果 App 取流接口返回格式异常")
+		}
+		code := firstNonEmpty(mapString(result, "code", "Code", "status_code"), mapString(nestedMap(result, "BaseResp"), "StatusCode"))
+		if code != "" && code != "0" {
+			return providerMedia{}, fmt.Errorf("红果 App 取流接口暂不可用（%s）", truncate(code, 20))
+		}
+		media, err := parseHongguoV5Playback(result, videoID)
+		if err != nil {
+			// 未返回所请求分集属于可重试的瞬时情况（换设备）；格式异常则直接报错。
+			if strings.Contains(err.Error(), "未返回所请求的分集") {
+				lastErr = err
+				continue
+			}
+			return providerMedia{}, err
+		}
+		return media, nil
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, signedURL, strings.NewReader(string(body)))
-	if err != nil {
-		return providerMedia{}, err
+	if lastErr == nil {
+		lastErr = errors.New("红果 App 取流接口未返回有效数据")
 	}
-	request.Header.Set("User-Agent", hongguoPlaybackUserAgent)
-	for key, value := range headers {
-		request.Header.Set(key, value)
-	}
-	response, err := d.doPreparedCatalogRequest(request, 20*time.Second, nil)
-	if err != nil {
-		return providerMedia{}, err
-	}
-	content, readErr := io.ReadAll(io.LimitReader(response.Body, providerMaxBodyBytes+1))
-	response.Body.Close()
-	if readErr != nil {
-		return providerMedia{}, readErr
-	}
-	if response.StatusCode != http.StatusOK {
-		return providerMedia{}, errors.New("红果 App 取流接口 HTTP " + strconv.Itoa(response.StatusCode))
-	}
-	if len(content) == 0 {
-		return providerMedia{}, errors.New("红果 App 取流接口未返回有效数据")
-	}
-	var result map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(content))
-	decoder.UseNumber()
-	if err := decoder.Decode(&result); err != nil || result == nil {
-		return providerMedia{}, errors.New("红果 App 取流接口返回格式异常")
-	}
-	// data[1004][videoID] 或直接 data[videoID]
+	return providerMedia{}, lastErr
+}
+
+// parseHongguoV5Playback 解析 multi_video_model 的响应体，对齐 1.0.4 模块 fetchAppMedia。
+// 关键点：分集数据在 data["1004"][videoID]（或 data[videoID]），播放线路藏在其
+// video_model 字段里，该字段可能是对象、JSON 字符串或 base64 字符串，必须二次解析。
+// 早期实现直接把整个 row 当 model，从不解析 video_model 字段，导致取流失败。
+func parseHongguoV5Playback(result map[string]any, videoID string) (providerMedia, error) {
 	data := nestedMap(result, "data")
 	inner := data
 	if m := nestedMap(data, "1004"); len(m) > 0 {
 		inner = m
 	}
-	row := inner[videoID]
-	model, _ := row.(map[string]any)
-	if model == nil {
-		// video_model 可能是 base64 字符串
-		encoded, _ := row.(string)
-		if encoded != "" {
-			if decoded, err := decodeHongguoBase64(encoded); err == nil && len(decoded) > 0 {
-				encoded = string(decoded)
-			}
-			decoder := json.NewDecoder(strings.NewReader(encoded))
-			decoder.UseNumber()
-			if err := decoder.Decode(&model); err != nil {
-				return providerMedia{}, errors.New("红果 App 播放信息格式异常")
-			}
+	row, _ := inner[videoID].(map[string]any)
+	if len(row) == 0 {
+		return providerMedia{}, errors.New("红果 App 未返回所请求的分集播放信息")
+	}
+	model, _ := row["video_model"].(map[string]any)
+	if encoded, _ := row["video_model"].(string); encoded != "" {
+		if decoded, err := decodeHongguoBase64(encoded); err == nil && len(decoded) > 0 {
+			encoded = string(decoded)
+		}
+		decoder := json.NewDecoder(strings.NewReader(encoded))
+		decoder.UseNumber()
+		if err := decoder.Decode(&model); err != nil {
+			return providerMedia{}, errors.New("红果 App 播放信息格式异常")
 		}
 	}
 	if len(model) == 0 {
-		if rows := anyList(inner["video_list"]); len(rows) > 0 {
+		if rows := anyList(row["video_list"]); len(rows) > 0 {
+			model = map[string]any{"video_list": row["video_list"], "video_duration": row["video_duration"], "duration": row["duration"]}
+		} else if rows := anyList(inner["video_list"]); len(rows) > 0 {
 			model = map[string]any{"video_list": inner["video_list"], "video_duration": inner["video_duration"], "duration": inner["duration"]}
 		}
 	}

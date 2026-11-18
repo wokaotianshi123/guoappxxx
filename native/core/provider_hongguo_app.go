@@ -34,9 +34,10 @@ type hongguoCatalogState struct {
 	DeviceID        string                          `json:"deviceId"`
 	InstallID       string                          `json:"installId"`
 	Registered      bool                            `json:"registered,omitempty"`
-	HelperDeviceID  string                          `json:"helperDeviceId,omitempty"`
-	HelperInstallID string                          `json:"helperInstallId,omitempty"`
-	Feeds           map[string]hongguoCatalogCursor `json:"feeds"`
+	HelperDeviceID   string                          `json:"helperDeviceId,omitempty"`
+	HelperInstallID  string                          `json:"helperInstallId,omitempty"`
+	HelperRegistered bool                            `json:"helperRegistered,omitempty"`
+	Feeds            map[string]hongguoCatalogCursor `json:"feeds"`
 }
 
 type hongguoAppClient struct {
@@ -88,7 +89,8 @@ func (downloader *Downloader) restoreHongguoCatalog(state *hongguoCatalogState) 
 	}
 	cloned := cloneHongguoCatalogState(state)
 	if !hongguoNumericID.MatchString(cloned.HelperDeviceID) || !hongguoNumericID.MatchString(cloned.HelperInstallID) {
-		cloned.HelperDeviceID, cloned.HelperInstallID = newHongguoDeviceID(), newHongguoDeviceID()
+		// 辅助设备号无效时重新生成随机号，并清除注册标记，确保后续会真正走注册。
+		cloned.HelperDeviceID, cloned.HelperInstallID, cloned.HelperRegistered = newHongguoDeviceID(), newHongguoDeviceID(), false
 	}
 	for name, cursor := range cloned.Feeds {
 		known := false
