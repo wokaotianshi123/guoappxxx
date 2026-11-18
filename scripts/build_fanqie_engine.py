@@ -7,9 +7,14 @@
 * ``libfanqie_shim``（cdylib / staticlib）：Android 走 ``.so``，iOS 走静态库，
   宿主进程内直接 FFI 调用 ``fanqie_init``。
 
-上游是 GPL-3.0 的 https://github.com/ch6vip/fqapp ，本仓库不内联它的源码，
+上游是 GPL-3.0 的 https://github.com/ch6vip/novel-sound （原 ch6vip/fqapp，
+已更名；GitHub codeload 对旧名会重定向，但这里统一用新名），本仓库不内联它的源码，
 而是按提交号下载后把 ``native/fanqie_shim`` 摆进它的 ``native/`` 目录下编译，
 这样 ``Cargo.toml`` 里的 ``../fqapp/rust`` 相对路径与上游布局一致。
+
+新版（commit 6e0eaf90 起）用 V5 签名重构了短剧取流（PR #425，
+``fix(drama): restore short drama playback with V5 signing``）；旧提交号
+aabde536 的播放接口已失效，番茄源会一直放不出来，务必跟上。
 
 用法（在仓库根目录）：:
 
@@ -52,8 +57,13 @@ def ensure_printable_stdio():
 ensure_printable_stdio()
 
 # 固定提交号：上游 master 随时会变，出包必须可复现。
-UPSTREAM_REPO = 'ch6vip/fqapp'
-UPSTREAM_COMMIT = 'aabde536c8621092f13b1a95f52e631b189f9243'
+# 上游仓库已从 ch6vip/fqapp 更名为 ch6vip/novel-sound（GitHub 旧名会重定向，
+# 但 codeload 直链未必可靠，直接写新名）。
+UPSTREAM_REPO = 'ch6vip/novel-sound'
+# 2026-11-17 的提交包含 fix(drama): restore short drama playback with V5 signing
+# （PR #425）：番茄短剧播放接口切到 multi_video_model + V5 签名（sign/v5.rs），
+# 与红果 1.0.4 是同一套修复。旧锁定提交 aabde536（11-02）不含此修复，番茄放不出来。
+UPSTREAM_COMMIT = '6e0eaf9049e29ded642dae327a45b072437b3e82'
 
 # Android：ABI → (Rust target, NDK clang 包装脚本名模板)。
 # CI 用 --split-per-abi 出三个 APK，每个 ABI 的包里都得有自己的
@@ -167,25 +177,57 @@ def patch_upstream_tls(upstream):
     text = video_rs.read_text(encoding='utf-8')
     if 'tls_backend_preconfigured' in text:
         return  # 已打过补丁
-    old = (
-        '            reqwest::Client::builder()\n'
-        '                .timeout(VIDEO_DOWNLOAD_TIMEOUT)\n'
-        '                .build()\n'
-        '                .ok()'
+
+    # 上游在不同提交里有两种 streaming_client 写法，补丁都要能打：
+    #   旧：裸 reqwest::Client::builder().timeout(..).build().ok()
+    #   新：policy.configure(reqwest::Client::builder()).timeout(..).build().map_err(..)
+    # 新版只改了外层包装（policy.configure），builder 本身仍是裸的，TLS 问题一样存在。
+    tls_stmt = (
+        'let tls = crate::upstream::http::build_tls_config()\n'
+        '                    .map_err(|e| format!("build streaming tls: {e}"))?;'
     )
-    new = (
+    injected = False
+    # 新版：在 policy.configure(...) 的 builder 后注入 TLS 配置。
+    old_new = (
+        '            policy\n'
+        '                .configure(reqwest::Client::builder())\n'
+        '                .timeout(VIDEO_DOWNLOAD_TIMEOUT)'
+    )
+    new_new = (
         '            // 安卓进程内核心没有初始化 rustls-platform-verifier，\n'
         '            // 裸 client 会在 build 时 panic；复用主链路的 webpki 配置。\n'
-        '            let tls = crate::upstream::http::build_tls_config().ok()?;\n'
-        '            reqwest::Client::builder()\n'
-        '                .tls_backend_preconfigured(tls)\n'
-        '                .timeout(VIDEO_DOWNLOAD_TIMEOUT)\n'
-        '                .build()\n'
-        '                .ok()'
+        '            ' + tls_stmt + '\n'
+        '            policy\n'
+        '                .configure(reqwest::Client::builder().tls_backend_preconfigured(tls))\n'
+        '                .timeout(VIDEO_DOWNLOAD_TIMEOUT)'
     )
-    if old not in text:
+    if old_new in text:
+        text = text.replace(old_new, new_new, 1)
+        injected = True
+    else:
+        # 旧版：裸 builder 结构。
+        old_legacy = (
+            '            reqwest::Client::builder()\n'
+            '                .timeout(VIDEO_DOWNLOAD_TIMEOUT)\n'
+            '                .build()\n'
+            '                .ok()'
+        )
+        new_legacy = (
+            '            // 安卓进程内核心没有初始化 rustls-platform-verifier，\n'
+            '            // 裸 client 会在 build 时 panic；复用主链路的 webpki 配置。\n'
+            '            let tls = crate::upstream::http::build_tls_config().ok()?;\n'
+            '            reqwest::Client::builder()\n'
+            '                .tls_backend_preconfigured(tls)\n'
+            '                .timeout(VIDEO_DOWNLOAD_TIMEOUT)\n'
+            '                .build()\n'
+            '                .ok()'
+        )
+        if old_legacy in text:
+            text = text.replace(old_legacy, new_legacy, 1)
+            injected = True
+    if not injected:
         raise SystemExit('上游 video.rs 的 streaming_client 结构与补丁不匹配，需人工核对')
-    video_rs.write_text(text.replace(old, new, 1), encoding='utf-8')
+    video_rs.write_text(text, encoding='utf-8')
     print('已为上游打上 webpki TLS 补丁（流式下载客户端）', flush=True)
 
 
